@@ -1,0 +1,23 @@
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+*.env.local
+
+# Windows artifacts
+nul
+
+# Build
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+build/
+
+# Test & coverage
+*.out
+coverage.*
