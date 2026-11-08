@@ -1,0 +1,4116 @@
+<title>爆炸猫开发文档</title>
+
+<callout emoji="💡">
+本文档记录爆炸猫（Exploding Kittens）在线桌游项目的技术方案，涵盖技术难点、技术栈选型及前后端模块划分与职责。
+</callout>
+
+# 一、技术难点
+
+## 1. 游戏状态同步与信息不对称
+
+爆炸猫是**完全信息不对称**游戏——每位玩家只能看到自己的手牌，牌库顺序对所有玩家不可见（除非使用偷看牌），弃牌堆公开。服务器必须作为**权威状态源**，客户端只渲染自己能看的信息。牌库是有序队列（偷看、洗牌、放回爆炸猫都会改变顺序），不能简单随机抽牌。   
+
+## 2. Nope 链的时序处理  
+
+Nope 可以打断任何行动，且 Nope 本身又能被 Nope，形成嵌套链。需要设计**动作栈（Action Stack）**机制：
+
+- 玩家 A 出三张猫牌 → 请求：要 B 的拆解
+- 玩家 B 出 Nope → 入栈顶
+- 玩家 A 出 Nope → 入栈顶
+- 结算：栈顶 Nope 生效 → 三张猫牌效果恢复 → B 给牌
+
+每个动作都需要**等待窗口期**让其他玩家有机会出 Nope，超时后自动结算。
+
+## 3. 攻击叠加的抽牌计数
+
+攻击牌让下家抽 N 张牌，下家打出攻击牌又传给下家，N 累加。需要维护一个**待抽牌计数器**，每回合递减，并在回合流转中正确传递。
+
+## 4. 回合与行动队列
+
+攻击牌改变回合顺序（跳过被攻击者），需要设计**灵活的回合调度器**，而非简单的轮转。转向、三张猫牌等需要选择目标玩家的操作，需要等待玩家响应。
+
+## 5. 防作弊与安全
+
+所有牌面逻辑必须在服务端验证，客户端只做展示。客户端不能知道牌库顺序、对手手牌、未翻开的牌。必须防止篡改请求（如伪造手牌、假装有拆解）。
+
+## 6. 断线重连与超时
+
+有人掉线不能无限等待，需要**超时机制**（如 60 秒无操作自动跳过/出牌）。断线重连后要恢复玩家的手牌视图，但牌库信息不能泄露给其他玩家。
+
+## 7. 组合技合法性校验
+
+服务端必须验证：确实是 3 张相同猫牌、目标玩家确实有指定牌、五张不同猫牌确实互不相同等。
+
+---
+
+# 二、技术栈
+
+## 后端
+
+| 技术 | 具体方案 | 理由 |
+|-|-|-|
+| 语言 | Go | 高性能并发，goroutine 天然适合 WebSocket 长连接管理；单二进制部署 |
+| WebSocket 库 | gorilla/websocket 或 nhooyr.io/websocket | 成熟稳定，Go 生态标准 WebSocket 方案 |
+| HTTP 框架 | 标准库 net/http 或 Gin | 轻量，游戏 API 不需要重型框架 |
+| 游戏逻辑 | 自研纯函数状态机 | 回合调度、动作栈、Nope 链、牌库引擎 |
+| 缓存 | Redis | 游戏状态内存缓存，快速读写，支持 pub/sub |
+| 数据库 | PostgreSQL | 用户信息、游戏历史记录、排行榜 |
+
+## 前端
+
+| 技术 | 具体方案 | 理由 |
+|-|-|-|
+| 框架 | React + TypeScript | 组件化，类型安全，与后端共享类型定义 |
+| 构建工具 | Vite | 极快 HMR，开发体验好 |
+| 状态管理 | Zustand | 轻量，适合游戏状态管理 |
+| 动画 | Framer Motion + CSS | 卡牌出牌、翻转、爆炸特效等动画 |
+| WebSocket 客户端 | 浏览器原生 WebSocket | 与 Go 后端配合，无需额外依赖 |
+| CSS 方案 | Tailwind CSS | 快速构建卡牌布局 |
+
+---
+
+# 三、模块划分与职责
+
+## 后端模块（Go）
+
+### server/ — 应用入口层
+
+- **main.go**：程序启动入口，初始化所有模块
+- **config.go**：配置管理（端口、Redis 连接、超时时间等）
+- **routes.go**：HTTP 路由和 WebSocket 升级处理
+
+### room/ — 房间管理
+
+- **Room**：房间实体，包含房间 ID、玩家列表、游戏状态、设置项
+- **RoomManager**：房间池，创建/加入/退出/解散房间
+- **RoomLifecycle**：房间状态机，等待中→游戏中→已结束
+
+### game/ — 核心游戏逻辑（纯函数，无 I/O）
+
+- **Deck**：牌库引擎，洗牌、抽牌、插牌、偷看牌顶、切牌
+- **Card**：卡牌类型定义，类型枚举、效果定义、组合规则
+- **Hand**：手牌操作，出牌、弃牌、抢牌、合法性校验
+- **TurnEngine**：回合调度器，当前玩家、下家、攻击叠加抽牌数   
+- **ActionStack**：动作栈，Nope 链核心实现，支持嵌套撤销
+- **MoveValidator**：合法性校验，检查出牌时机、目标、组合条件
+- **GameOver**：胜负判定，检查是否只剩一人
+
+### session/ — 玩家与会话状态
+
+- **PlayerState**：单个玩家状态（手牌、存活、拆解数、连接状态）
+- **GameState**：全局游戏状态（牌库、弃牌堆、当前回合、动作栈）
+- **StateSerializer**：状态序列化，按玩家视角过滤可见信息
+
+### network/ — 网络通信
+
+- **GameSocket**：WebSocket 连接管理，封装读写
+- **EventHandler**：事件分发，客户端消息→路由到游戏逻辑
+- **Broadcaster**：广播，向全员/单人/部分玩家发送状态更新
+
+### timer/ — 超时控制
+
+- **TurnTimer**：回合超时，60 秒无操作自动跳过/出牌
+- **NopeTimer**：Nope 等待窗口，3 秒无人出 Nope 则自动结算
+- **ReconnectTimer**：断线重连倒计时，掉线后 90 秒等待
+
+### persistence/ — 持久化
+
+- **RedisAdapter**：Redis 读写，缓存游戏状态
+- **Database**：PostgreSQL 操作，用户信息、战绩、历史记录
+
+### types/ — 共享类型定义
+
+- 卡牌类型枚举、事件类型枚举、游戏阶段枚举、所有 DTO 定义
+
+## 前端模块（React + TypeScript）
+
+### pages/ — 页面级组件
+
+- **HomePage**：首页，创建/加入房间、设置昵称
+- **RoomPage**：房间等待页，玩家列表、准备状态
+- **GamePage**：游戏主页面，牌桌视图
+- **ResultPage**：结算页，胜负结果、再来一局
+
+### components/Card/ — 卡牌相关
+
+- **CardView**：单张卡牌渲染（正面/背面）
+- **HandArea**：手牌区，扇形排列，可选中
+- **DeckView**：牌库视图，显示背面，偷看后显示牌顶
+- **DiscardPile**：弃牌堆
+
+### components/Board/ — 牌桌布局
+
+- **GameBoard**：牌桌整体布局
+- **PlayerAvatar**：玩家头像，存活/出局状态标识
+- **TurnIndicator**：当前回合指示器
+- **OpponentHand**：对手手牌，仅显示背面张数
+
+### components/Actions/ — 操作面板
+
+- **ActionPanel**：可执行的操作按钮列表
+- **NopePrompt**：Nope 弹窗，是否出 Nope，倒计时
+- **CardSelector**：选牌弹窗，转向/三张猫牌时选目标牌
+- **TargetSelector**：选目标玩家弹窗       
+
+### hooks/ — 自定义 Hooks
+
+- **useSocket**：WebSocket 连接管理
+- **useGameState**：游戏状态订阅与更新
+- **useTimer**：倒计时逻辑
+- **useCardDrag**：卡牌拖拽交互
+
+### services/ — 网络层
+
+- **socket**：WebSocket 客户端实例
+- **eventEmitter**：事件注册/解绑封装
+- **api**：REST API 调用
+
+### store/ — 状态管理
+
+- **gameStore**：游戏状态
+- **roomStore**：房间状态
+- **userStore**：用户信息
+
+
+
+# 四、后端模块技术设计
+
+## 4.1 信息存储方案
+
+爆炸猫是高频实时交互游戏，每张牌的操作都会改变状态。不推荐将游戏中的状态直接存储在数据库中，因为每次操作都需要完整的 DB 读写往返，延迟过高。推荐采用**三层存储架构**：
+
+### 第1层：内存（Primary）
+
+游戏进行中的**所有状态只存在于内存**，用 Go 的普通 struct 表示。整个游戏状态只在一个 goroutine 内串行处理（通过 channel 驱动），不需要分布式锁。状态量极小，按 5 人局算，全部序列化仅 2-5 KB，出牌操作是纯内存操作，纳秒级完成。
+
+```go
+type GameState struct {
+    Deck        []Card              // 牌库（有序队列）
+    DiscardPile []Card              // 弃牌堆
+    Hands       map[string][]Card   // 玩家手牌
+    Turn        TurnState
+    ActionStack []Action
+    Status      GameStatus
+    Players     []PlayerInfo
+}
+```
+
+### 第2层：Redis（热备）
+
+内存状态在服务器崩溃时会丢失，用 Redis 做轻量级备份。每次状态变更后异步序列化写入 Redis，不阻塞游戏主流程。设置 TTL（如 24 小时）自动清理已结束/废弃的房间。Redis 是内存的二级镜像，不是主存储，其性能接近内存，提供了跨进程的持久能力。
+
+```bash
+SET game_state:room:{room_id} <JSON>
+EXPIRE game_state:room:{room_id} 86400
+```
+
+### 第3层：PostgreSQL（归档）
+
+只在对局**结束后**写入，不参与游戏进行中的任何路径。用于存储用户信息、战绩、排行榜、历史对局记录（含全量操作日志，可用于回放）。
+
+```sql
+CREATE TABLE game_records (
+    id           UUID PRIMARY KEY,
+    room_id      VARCHAR(32),
+    players      JSONB,
+    action_log   JSONB,
+    result       JSONB,
+    created_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ
+);
+```
+
+### 数据流总览
+
+```text
+Client A --+
+Client B --+-- WebSocket --> Game Handler --> 纯函数状态机 --> 新状态
+Client C --+                                                    |
+                                                                +--> 更新内存 (primary)
+                                                                +--> 异步 --> Redis (backup)
+                                                                +--> 异步 --> 广播给客户端
+
+游戏结束后 --> PostgreSQL (archive)
+```
+
+### 数据分布总表
+
+| 数据 | 存储位置 | 原因 |
+|-|-|-|
+| 游戏中的状态（牌库、手牌、动作栈） | **内存** | 极低延迟，状态量小 |
+| 游戏状态备份 | **Redis** | 快速恢复，异步写入不阻塞 |
+| 用户账号信息 | **PostgreSQL** | 持久化，不频繁读写 |
+| 历史对局记录 | **PostgreSQL** | 游戏结束后写入，离线分析 |
+| 排行榜/统计数据 | **PostgreSQL** | 定期计算或离线聚合 |
+
+**核心原则**：游戏进行中的热路径全部走内存，数据库只做持久化和离线查询。
+
+## 4.2 Redis 存储内容
+
+Redis 存储的是**游戏状态的完整快照**，用于服务器崩溃后的恢复。一个房间对应一个 Redis key，value 是整个游戏状态的 JSON 序列化。
+
+具体包含以下四部分：
+
+- **牌库（Deck）**：牌库里的每张牌，按当前顺序一字排开，包含牌面朝下的所有牌和爆炸猫的位置。
+- **手牌（Hands）**：每名玩家手里的牌。Redis 存全量（包括敏感信息），因为服务器崩溃后需要完整恢复。
+- **弃牌堆（Discard Pile）**：已经打出的牌，按打出顺序排列。
+- **回合状态 + 动作栈**：当前轮到谁、方向、待抽牌数、Nope 链上的待处理动作。
+
+值得注意的是，Redis 存的是序列化后的卡牌对象（Card.id + Card.type），不是数据库行记录。卡牌从始至终没有独立的数据库行，它们只在游戏初始化时由 Go 代码构造出来，存在于内存中，以 JSON 形式备份到 Redis。
+
+## 4.3 多玩家交互技术
+
+### 传输层：WebSocket
+
+爆炸猫的所有操作（出牌、Nope、选目标）都是双向高频交互，WebSocket 是唯一合理选择。它提供双向通信和低延迟，浏览器原生支持。
+
+### 并发模型：每房间一个 goroutine + channel
+
+核心模式是**一个房间对应一个 goroutine，所有游戏逻辑串行执行**。每个玩家连接后，把 WebSocket 的读写封装成 channel，注册到房间的 inbox。游戏逻辑 goroutine 只有一个，所有玩家消息通过 channel 汇入，串行处理，不需要任何锁，没有竞态条件。
+
+```go
+func (r *Room) Run(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case msg := <-r.inbox:
+            r.handleMessage(msg)    // 串行处理所有玩家消息
+        case <-r.turnTimer.C:
+            r.handleTimeout()
+        case <-r.nopeTimer.C:
+            r.resolveNopeWindow()
+        }
+    }
+}
+```
+
+### 消息协议设计
+
+**客户端 → 服务端（Action）**：
+
+```json
+{
+  "type": "play_card",
+  "payload": {
+    "card_ids": ["cat_01", "cat_02", "cat_03"],
+    "target_player": "user_002",
+    "target_card_type": "defuse"
+  }
+}
+```
+
+**服务端 → 客户端（Event）**：
+
+```json
+{
+  "type": "state_update",
+  "payload": {
+    "your_hand": [{"id": "defuse_01", "type": "defuse"}],
+    "opponents": [{"id": "user_002", "hand_size": 4, "alive": true}],
+    "discard_pile": [{"id": "skip_01", "type": "skip"}],
+    "deck_count": 28,
+    "current_turn": "user_001",
+    "pending_draws": 0,
+    "phase": "action",
+    "action_stack": [],
+    "nope_remaining_ms": 0
+  }
+}
+```
+
+### 广播策略：按视角过滤
+
+服务端收到 Action → 状态机处理 → 产生新状态 → 对每个玩家分别序列化后发送。每个玩家只能看到自己的手牌，对手只显示手牌张数，牌库只显示剩余数量。
+
+```go
+func (r *Room) BroadcastState() {
+    for playerID, ch := range r.connections {
+        view := r.SerializeFor(playerID)
+        data, _ := json.Marshal(view)
+        ch <- data
+    }
+}
+```
+
+### 断线重连
+
+服务端检测到读错误 → 标记玩家为 disconnected → 启动 ReconnectTimer（90秒）。玩家重新连接时建立新 WebSocket，服务端发送完整当前状态视图（按该玩家视角过滤）。超时未重连则自动弃权/出局。
+
+## 4.4 回合调度器设计
+
+爆炸猫的回合流充满异常跳转，不能使用简单的轮转。核心模型是**环形链表 + 有限状态机**。
+
+### 玩家回合的两个阶段
+
+```text
+                    +--------------------------+
+                    |                          |
+                    v                          |
+    +----------+  出牌/Skip/Attack  +----------+
+    | Action   | ---------------> | Action   |
+    | (出牌阶段) |                   | (同一玩家) |
+    +----+-----+                   +----+-----+
+         |                              |
+         | 选择结束出牌                   | 打出 Attack
+         v                              v
+    +----------+                  +----------+
+    | Drawing  |                  | 轮到下家  |
+    | (抽牌阶段) |                  | Drawing  |
+    +----+-----+                  +----+-----+
+         |                              |
+         | pendingDraws == 0            | pendingDraws > 0
+         v                              v
+    +----------+                  +----------+
+    | 轮到下家  |                  | 继续抽牌  |
+    | Action   |                  | Drawing  |
+    +----------+                  +----------+
+```
+
+### 核心数据结构
+
+```go
+type TurnEngine struct {
+    players      []string  // 存活玩家，按座位顺序
+    currentIdx   int       // 当前玩家在 players 中的索引
+    direction    int       // 1 = 顺时针, -1 = 逆时针
+    pendingDraws int       // 攻击牌累积的待抽牌数
+    phase        TurnPhase
+}
+
+type TurnPhase int
+
+const (
+    PhaseAction     TurnPhase = iota // 出牌阶段
+    PhaseDrawing                     // 抽牌阶段
+    PhaseNopeWindow                  // Nope 等待窗口
+    PhaseGameOver                    // 游戏结束
+)
+```
+
+### 核心方法
+
+```go
+// 获取下一个存活玩家的索引（环形）
+func (te *TurnEngine) nextIndex() int {
+    next := te.currentIdx + te.direction
+    n := len(te.players)
+    if next >= n { return 0 }
+    if next < 0 { return n - 1 }
+    return next
+}
+
+// 玩家打出 Skip
+func (te *TurnEngine) OnSkip() {
+    te.currentIdx = te.nextIndex()
+    te.phase = PhaseAction
+}
+
+// 玩家打出 Attack
+func (te *TurnEngine) OnAttack() {
+    te.pendingDraws += 2
+    te.currentIdx = te.nextIndex()
+    te.phase = PhaseDrawing // 下家直接进入抽牌阶段
+}
+
+// 抽了一张牌（非爆炸猫）
+func (te *TurnEngine) OnCardDrawn() {
+    te.pendingDraws--
+    if te.pendingDraws <= 0 {
+        te.currentIdx = te.nextIndex()
+        te.phase = PhaseAction
+    }
+}
+
+// 玩家出局
+func (te *TurnEngine) RemovePlayer(playerID string) {
+    idx := indexOf(te.players, playerID)
+    if idx < te.currentIdx { te.currentIdx-- }
+    te.players = append(te.players[:idx], te.players[idx+1:]...)
+    if len(te.players) == 1 { te.phase = PhaseGameOver }
+}
+```
+
+**核心设计**：pendingDraws 作为债务在整个回合系统中流转。打 Attack 则债务 +2 并转给下家，不打出 Attack 则自己还债（抽牌），还完债轮到下家。
+
+## 4.5 游戏状态机
+
+游戏状态机把一局游戏的**整个生命周期**拆成若干个明确的状态，并且规定清楚在哪个状态能做什么事，做完后进入哪个状态。
+
+### 生命周期状态
+
+```text
+         +--------------+
+         |   Waiting    |  <- 等人齐，准备阶段
+         +------+-------+
+                | 所有人点准备
+                v
+         +--------------+
+         |   Dealing    |  <- 发牌阶段（发拆解、普通牌，插爆炸猫）
+         +------+-------+
+                | 发牌完成
+                v
+    +---------------------------+
+    |       Playing             |  <- 游戏进行中
+    |  +--------------------+   |
+    |  |  Action Phase      |   |  <- 出牌阶段，可以出牌/结束
+    |  +--------+-----------+   |
+    |           | 选择抽牌       |
+    |           v               |
+    |  +--------------------+   |
+    |  |  Drawing Phase     |   |  <- 抽牌阶段，必须抽牌
+    |  +--------+-----------+   |
+    |           | 抽到牌         |
+    |  +--------+-----------+   |
+    |  |  Nope Window       |   |  <- 等待3秒，看是否有人出 Nope
+    |  +--------+-----------+   |
+    |           | 超时或结算完毕  |
+    |           v               |
+    |  +--------------------+   |
+    |  | 回到 Action/Draw   |   |  <- 继续游戏
+    |  +--------------------+   |
+    +----------+----------------+
+               | 只剩一人存活
+               v
+         +--------------+
+         |   GameOver   |  <- 游戏结束
+         +--------------+
+```
+
+### 状态与操作的约束关系
+
+| 操作 | Waiting | Dealing | Playing | GameOver |
+|-|-|-|-|-|
+| 出牌 | 禁止 | 禁止 | 允许 | 禁止 |
+| 抽牌 | 禁止 | 禁止 | 允许 | 禁止 |
+| 准备 | 允许 | 禁止 | 禁止 | 禁止 |
+| 出 Nope | 禁止 | 禁止 | 允许\* | 禁止 |
+
+### 状态机 vs 回合调度器
+
+| 层次 | 负责 | 例子 |
+|-|-|-|
+| **游戏状态机** | 整局游戏的宏观生命周期 | 等待→发牌→游戏→结束 |
+| **回合调度器** | 游戏进行中的微观轮转 | 谁出牌、下一步谁、欠几张牌 |
+
+状态机管"游戏进行到什么大阶段了"，回合调度器管"游戏进行中，具体轮到谁了"。
+
+## 4.6 Nope 链设计
+
+Nope 链是爆炸猫**最复杂的机制**。核心难点不在于栈本身，而在于 Nope 窗口的计时重置和多玩家同时出 Nope 的裁决。
+
+### Nope 链的本质：奇偶抵消
+
+从栈底往上遍历，Nope 每出现一次就翻转一次生效状态：
+
+```text
+A 出三张猫牌 --> Nope(B) --> Nope(A) --> Nope(C)
+                                         |
+                              栈顶 Nope 生效，C 的 Nope 抵消了 A 的 Nope
+                              最终结果：三张猫牌被 B 的 Nope 抵消
+
+数学上：从栈底向上遍历，Nope 每出现一次翻转一次生效状态
+初始: 三张猫牌 = 生效
+遇到 Nope(B) --> 翻转 --> 不生效
+遇到 Nope(A) --> 翻转 --> 生效
+遇到 Nope(C) --> 翻转 --> 不生效（最终结果）
+```
+
+### 动作栈数据结构
+
+```go
+type ActionStack struct {
+    stack []StackEntry
+    timer *time.Timer
+}
+
+type StackEntry struct {
+    Action     Action   // 原始动作
+    Actor      string   // 发起者
+    Noped      bool     // 是否被 Nope（结算时计算）
+}
+
+type ActionType int
+
+const (
+    ActionPlayCard   ActionType = iota // 出牌
+    ActionNope                         // 出 Nope
+    ActionDraw                         // 抽牌
+)
+```
+
+### Nope 窗口的时序管理
+
+Nope 窗口需要满足：每次有人出牌 → 开启 3 秒窗口；有人出了 Nope → 重置窗口，再等 3 秒；3 秒内无人出 Nope → 自动结算。
+
+```go
+// 开启 Nope 窗口
+func (g *GameLoop) openNopeWindow(duration time.Duration) {
+    if g.nopeTimer != nil { g.nopeTimer.Stop() }
+    g.nopeTimer = time.NewTimer(duration)
+    g.state.Turn.Phase = PhaseNopeWindow
+    g.broadcastNopePrompt(duration)
+}
+
+// 有人出 Nope
+func (g *GameLoop) handleNope(playerID string) {
+    g.state.ActionStack.Push(StackEntry{
+        Action: Action{Type: ActionNope},
+        Actor:  playerID,
+    })
+    g.openNopeWindow(3 * time.Second)  // 重置窗口
+    g.broadcastNopePlayed(playerID)
+}
+
+// 结算（奇偶抵消）
+func (s *ActionStack) Resolve() ResolveResult {
+    baseAction := s.stack[0]
+    nopeCount := 0
+    for i := 1; i < len(s.stack); i++ {
+        if s.stack[i].Action.Type == ActionNope {
+            nopeCount++
+        }
+    }
+    return ResolveResult{
+        Action:        baseAction,
+        ActionBlocked: nopeCount%2 == 1,
+        NopeCount:     nopeCount,
+    }
+}
+```
+
+### 竞态处理
+
+Nope 窗口关闭的瞬间，可能有玩家恰好在同一时刻出了 Nope。Go 的 select 对多个就绪的 case 是随机选择，所以不能直接依赖 timer.C 触发就结算。需要在结算前先 drain 掉 inbox 中积压的消息：
+
+```go
+func (g *GameLoop) resolveNopeWindow() {
+    // 先 drain inbox 中积压的 Nope 消息
+    g.drainPendingNopes()
+
+    // 如果栈顶是 Nope，说明窗口内有人出 Nope，重新开启窗口
+    if g.state.ActionStack.TopIsNope() {
+        g.openNopeWindow(3 * time.Second)
+        return
+    }
+
+    // 真的没人出 Nope，结算
+    g.state.ActionStack.Resolve()
+}
+
+func (g *GameLoop) drainPendingNopes() {
+    for {
+        select {
+        case msg := <-g.inbox:
+            g.handleMessage(msg)
+        default:
+            return
+        }
+    }
+}
+```
+
+### 多人同时出 Nope
+
+所有消息通过 channel 串行化，不存在真正的"同时"。即使两个 WebSocket 读 goroutine 同时读到数据，它们写入 channel 时也是串行化的。游戏主 goroutine 从 channel 里一条一条读，自然有序。
+
+
+
+# 五、后端框架设计
+
+## 5.1 架构总览
+
+后端整体采用 **MVC + Service + Repository 分层架构**，与模块三的领域划分（room/、game/、session/ 等）正交互补。模块三按"业务领域"组织代码，MVC 按"架构层次"组织代码，两层映射关系如下：
+
+| MVC 层次 | 对应模块三的领域 | 职责 |
+|-|-|-|
+| **Model** | types/, game/（数据部分）, session/ | 数据模型、业务规则、状态表示 |
+| **View** | network/（广播部分） | 客户端呈现的数据序列化、视角过滤 |
+| **Controller** | server/, network/（事件处理部分） | 请求入口、消息路由、参数校验 |
+| **Service** | room/, game/（流程编排） | 业务编排、事务协调、领域服务 |
+| **Repository** | persistence/ | 数据持久化、缓存读写 |
+
+## 5.2 项目目录结构
+
+```
+exploding-kittens-server/
+│
+├── cmd/                               # 应用入口层
+│   └── server/
+│       └── main.go                    # 程序启动入口，初始化依赖、启动 HTTP 服务
+│
+├── internal/                          # 内部包（不对外暴露）
+│   │
+│   ├── config/                        # 配置管理
+│   │   ├── config.go                  # 配置结构体定义，支持 YAML/环境变量/命令行
+│   │   └── config.yaml                # 默认配置文件（端口、Redis/DB 连接、超时参数）
+│   │
+│   ├── model/                         # Model 层：数据模型与业务规则
+│   │   ├── card.go                    # 卡牌模型：Card 结构体、类型枚举、组合规则
+│   │   ├── deck.go                    # 牌库模型：牌库初始化、洗牌、抽牌、插牌、切牌
+│   │   ├── hand.go                    # 手牌模型：手牌增删、找牌、组合校验
+│   │   ├── player.go                  # 玩家模型：玩家信息、存活状态、拆解牌数量
+│   │   ├── game.go                    # 游戏状态模型：完整游戏状态的聚合根
+│   │   ├── turn.go                    # 回合模型：回合轮转、方向、待抽牌计数器
+│   │   ├── action.go                  # 动作模型：动作栈、Nope 链、栈条目定义
+│   │   ├── room.go                    # 房间模型：房间实体、玩家列表、游戏设置
+│   │   └── errors.go                  # 领域错误定义：牌型错误、非法操作、状态冲突
+│   │
+│   ├── repository/                    # Repository 层：数据持久化抽象
+│   │   ├── interfaces.go              # Repository 接口定义（依赖倒置）
+│   │   ├── redis.go                   # Redis 实现：游戏状态快照读写、TTL 管理
+│   │   ├── postgres.go                # PostgreSQL 实现：用户信息、战绩、历史记录
+│   │   └── cache.go                   # 缓存抽象：读写接口、序列化/反序列化
+│   │
+│   ├── service/                       # Service 层：业务编排与领域服务
+│   │   ├── game_service.go            # 游戏服务：出牌流程、抽牌流程、Nope 结算
+│   │   ├── room_service.go            # 房间服务：创建/加入/退出/解散房间、准备
+│   │   ├── turn_service.go            # 回合服务：回合流转、攻击累积、转向处理
+│   │   ├── timer_service.go           # 超时服务：回合超时、Nope 窗口、重连等待
+│   │   └── auth_service.go            # 认证服务：登录、Token 签发与验证
+│   │
+│   ├── controller/                    # Controller 层：请求处理与调度
+│   │   ├── auth_controller.go         # 认证控制器：注册/登录/刷新 Token 接口
+│   │   ├── room_controller.go         # 房间控制器：HTTP 接口（创建/加入/查询房间）
+│   │   ├── game_controller.go         # 游戏控制器：WebSocket 消息分发（出牌/抽牌/Nope）
+│   │   └── ws_controller.go           # WebSocket 控制器：连接升级、读写管理、断线检测
+│   │
+│   ├── view/                          # View 层：序列化与呈现
+│   │   ├── serializer.go              # 状态序列化器：按玩家视角过滤并序列化游戏状态
+│   │   ├── event.go                   # 事件定义：所有服务端推送事件的消息格式
+│   │   ├── response.go                # 统一响应格式：HTTP 响应结构体、错误码封装
+│   │   └── dto.go                     # 数据传输对象：Action 请求 DTO、State 响应 DTO
+│   │
+│   ├── middleware/                    # HTTP 中间件
+│   │   ├── auth.go                    # 认证中间件：Token 校验、注入玩家身份
+│   │   ├── cors.go                    # CORS 中间件：跨域请求控制
+│   │   ├── recovery.go                # 异常恢复中间件：panic 捕获、优雅返回 500
+│   │   └── logging.go                 # 日志中间件：请求日志、链路追踪
+│   │
+│   └── router/                        # 路由注册
+│       ├── router.go                  # 主路由：注册所有 HTTP 路由和 WebSocket 端点
+│       └── routes.go                  # 路由表定义：路径、方法、Handler 映射关系
+│
+├── pkg/                               # 可复用工具包
+│   ├── logger/                        # 日志工具：结构化日志、分级输出
+│   ├── errors/                        # 自定义错误：错误类型、错误码、错误包装
+│   └── utils/                         # 通用工具：ID 生成器、随机数、时间工具
+│
+├── migrations/                        # 数据库迁移脚本
+│   └── 001_init.sql                   # 初始建表：用户表、游戏记录表、排行榜表
+│
+├── scripts/                           # 辅助脚本
+│   ├── seed.go                        # 测试数据填充脚本
+│   └── migrate.sh                     # 数据库迁移执行脚本
+│
+├── configs/                           # 环境配置文件
+│   ├── config.dev.yaml                # 开发环境配置
+│   ├── config.staging.yaml            # 预发布环境配置
+│   └── config.prod.yaml               # 生产环境配置
+│
+├── go.mod                             # Go 模块定义
+├── go.sum                             # Go 依赖锁文件
+├── Dockerfile                         # Docker 构建文件
+├── Makefile                           # 构建、测试、运行命令
+└── .env.example                       # 环境变量模板
+```
+
+## 5.3 各层职责说明
+
+### Model 层（数据模型）
+
+Model 层位于架构最底层，是一切领域逻辑的根基。它**不依赖任何其他层**，只包含纯数据结构和业务规则函数。
+
+- 定义卡牌、牌库、手牌、玩家、游戏状态等核心实体
+- 实现无副作用的纯函数：洗牌、抽牌、组合校验、Nope 链奇偶抵消
+- 不包含任何 I/O 操作（无网络、无数据库、无文件读写）
+- 不依赖任何外部框架或库（Go 标准库即可）
+
+### Repository 层（数据持久化）
+
+Repository 层对上层暴露接口，隐藏底层存储实现。Service 层只依赖接口，不依赖具体实现。
+
+- 定义 Repository 接口，支持依赖注入
+- 提供 Redis 实现：游戏状态快照的读写，设置 TTL 自动过期
+- 提供 PostgreSQL 实现：用户信息、历史记录、排行榜的持久化
+- 游戏进行中的热路径只走 Redis，游戏结束后才写入 PostgreSQL
+
+### Service 层（业务编排）
+
+Service 层是 Controller 和 Model 之间的桥梁，编排多个 Model 完成一个完整的业务流程。
+
+- 游戏服务：协调 Deck、Hand、ActionStack 完成出牌→校验→执行→广播
+- 房间服务：管理房间生命周期，协调玩家进出
+- 回合服务：驱动 TurnEngine 完成回合流转，处理攻击叠加
+- 超时服务：管理 TurnTimer、NopeTimer、ReconnectTimer 的生命周期
+
+### Controller 层（请求处理）
+
+Controller 层是外部请求的入口，负责解析输入、调用 Service、返回结果。
+
+- 不包含业务逻辑，只做参数校验和请求分发
+- HTTP Controller：处理 RESTful 接口（注册、登录、房间操作）
+- WebSocket Controller：处理双向消息（出牌、抽牌、Nope、选目标）
+- 将 WebSocket 的读 goroutine 与游戏主 goroutine 通过 channel 解耦
+
+### View 层（序列化呈现）
+
+View 层负责将服务端内部状态转换为客户端可见的格式，核心是"按视角过滤"。
+
+- 每个玩家看到的游戏状态不同（自己的手牌 vs 对手的手牌数量）
+- 序列化器根据玩家 ID 过滤敏感信息后生成 JSON
+- 定义所有事件类型（state_update、nope_prompt、game_over 等）
+- 定义统一的 HTTP 响应格式（code、message、data 结构）
+
+## 5.4 请求处理流程
+
+```
+┌──────────┐     ┌────────────┐     ┌──────────┐     ┌──────────┐     ┌─────────┐
+│  Client  │ ──> │ Controller │ ──> │ Service  │ ──> │  Model   │ ──> │  State  │
+│ (WS/HTTP)│ <── │  (路由分发)  │ <── │ (业务编排)  │ <── │ (数据模型)  │ <── │ (变更)   │
+└──────────┘     └────────────┘     └──────────┘     └──────────┘     └────┬────┘
+                                                                          │
+                                                    ┌─────────────────────┘
+                                                    │
+                                              ┌─────v─────┐     ┌───────────────┐
+                                              │  View     │ ──> │   Client     │
+                                              │ (序列化+广播) │     │  (按视角过滤)   │
+                                              └───────────┘     └───────────────┘
+```
+
+### 完整流程示例：玩家出牌
+
+1. **Client** 发送 WebSocket 消息 `{"type":"play_card","card_ids":["cat_01","cat_02","cat_03"],"target_player":"user_002"}`
+2. **Controller**（game_controller.go）解析消息，校验 JSON 格式，提取参数
+3. **Controller** 将消息放入房间 inbox channel
+4. **Service**（game_service.go）从 inbox 读取消息，调用 Model 层的 MoveValidator 校验合法性
+5. **Model**（hand.go → deck.go → action.go）执行出牌：从手牌移除、加入弃牌堆、入动作栈
+6. **Service** 调用 TimerService 开启 Nope 等待窗口
+7. **View**（serializer.go）遍历所有玩家，按各人视角序列化新状态
+8. **Controller** 通过 WebSocket 将序列化后的状态分别发送给每个玩家
+9. **Repository**（redis.go）异步将新状态快照写入 Redis
+
+## 5.5 依赖方向
+
+# 六、后端实体类设计
+
+## 6.1 实体关系总览
+
+```
+┌──────────┐        ┌──────────┐        ┌──────────┐
+│   Room   │ 1 ── N │  Player  │ 1 ── 1 │   Hand   │
+│ (房间实体) │        │ (玩家实体) │        │ (手牌实体) │
+└──────────┘        └──────────┘        └──────────┘
+      1                  1                    N
+      │                  │                    │
+      │                  │                    │
+      v                  v                    v
+┌──────────┐        ┌──────────┐        ┌──────────┐
+│GameState │ 1 ── 1 │TurnEngine│        │   Card   │
+│(游戏状态) │        │(回合调度器)│        │ (卡牌实体) │
+└──────────┘        └──────────┘        └──────────┘
+      │
+      ├── 1 ── 1 ── Deck (牌库实体)
+      ├── 1 ── 1 ── DiscardPile (弃牌堆实体)
+      └── 1 ── 1 ── ActionStack (动作栈实体)
+```
+
+- **Room** 是顶层聚合根，包含 GameState 和所有 Player
+- **GameState** 聚合所有游戏运行时的状态（牌库、弃牌堆、回合、动作栈）
+- **Player** 持有自己的 Hand（手牌集合）
+- **Card** 是值对象，在牌库、手牌、弃牌堆之间流转
+
+## 6.2 枚举与常量定义
+
+### CardType（卡牌类型枚举）
+
+| 枚举值 | 中文名 | 牌堆数量（5人局） | 说明 |
+|-|-|-|-|
+| ExplodingKitten | 爆炸猫 | N-1 | 抽到即出局（除非有拆解） |
+| Defuse | 拆解 | 2 | 抵消爆炸猫，可插回牌库任意位置 |
+| Skip | 跳过 | 4 | 跳过本回合抽牌阶段 |
+| Attack | 攻击 | 4 | 下家抽 2 张牌，且下家不能出牌 |
+| Favor | 索要 | 4 | 指定玩家必须给一张牌 |
+| Shuffle | 洗牌 | 4 | 随机洗乱牌库 |
+| SeeTheFuture | 预言 | 5 | 偷看牌库顶 3 张牌 |
+| Nope | 否决 | 5 | 取消任意一张牌的效果（非拆解/爆炸猫） |
+| CatCard | 猫牌 | 20 | 三张相同换一张指定牌；五张不同换一张弃牌堆牌 |
+
+### GamePhase（游戏阶段枚举）
+
+| 枚举值 | 含义 | 说明 |
+|-|-|-|
+| Waiting | 等待中 | 房间已创建，等待玩家准备 |
+| Dealing | 发牌中 | 发拆解牌和普通牌，插入爆炸猫 |
+| Playing | 游戏中 | 正常游戏进行中 |
+| GameOver | 已结束 | 只剩一人存活，游戏结束 |
+
+### TurnPhase（回合阶段枚举）
+
+| 枚举值 | 含义 | 说明 |
+|-|-|-|
+| Action | 出牌阶段 | 玩家可以出牌或结束出牌 |
+| Drawing | 抽牌阶段 | 玩家必须抽牌（可能触发爆炸猫） |
+| NopeWindow | Nope 等待 | 等待其他玩家出 Nope，3 秒超时 |
+| GameOver | 游戏结束 | 回合不再流转 |
+
+### ConnectionStatus（连接状态枚举）
+
+| 枚举值 | 含义 | 说明 |
+|-|-|-|
+| Connected | 已连接 | WebSocket 正常 |
+| Disconnected | 断线中 | 掉线但未超时，等待重连 |
+| TimedOut | 已超时 | 掉线超过重连等待时间 |
+
+## 6.3 实体定义
+
+### Room（房间实体）
+
+房间是游戏的最顶层容器，一个房间对应一局游戏。
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| ID | string | 房间唯一标识（6位邀请码或 UUID） |
+| Name | string | 房间名称 |
+| OwnerID | string | 房主玩家 ID |
+| Players | []Player | 房间内所有玩家 |
+| GameState | GameState | 当前游戏状态（nil 表示未开始） |
+| Status | GamePhase | 房间生命周期状态 |
+| Settings | RoomSettings | 房间设置（最大人数、超时时间等） |
+| CreatedAt | int64 | 创建时间戳 |
+| Inbox | chan Message | 玩家消息汇入通道 |
+
+### RoomSettings（房间设置）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|-|-|-|-|
+| MaxPlayers | int | 5 | 最大玩家数（2-5） |
+| TurnTimeout | int | 60 | 回合超时秒数 |
+| NopeWindow | int | 3 | Nope 等待窗口秒数 |
+| ReconnectTimeout | int | 90 | 断线重连等待秒数 |
+
+### Player（玩家实体）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| ID | string | 玩家唯一标识 |
+| Nickname | string | 玩家昵称 |
+| Hand | Hand | 玩家手牌 |
+| Alive | bool | 是否存活 |
+| DefuseCount | int | 持有的拆解牌数量 |
+| ConnectionStatus | ConnectionStatus | 连接状态 |
+| IsReady | bool | 是否已准备（等待阶段） |
+| JoinedAt | int64 | 加入房间时间 |
+
+### Hand（手牌实体）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| PlayerID | string | 所属玩家 ID |
+| Cards | []Card | 手牌列表（有序） |
+| Count | int | 手牌数量（可快速获取） |
+
+### Card（卡牌值对象）
+
+卡牌是值对象，不可变，创建后不在生命周期内修改。
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| ID | string | 卡牌唯一标识（如 "cat_001"、"defuse_01"） |
+| Type | CardType | 卡牌类型 |
+| Name | string | 卡牌名称（中文展示名） |
+| Description | string | 卡牌效果描述 |
+
+### Deck（牌库实体）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| Cards | []Card | 牌库中的牌（有序队列，第 0 张为牌顶） |
+| Count | int | 剩余牌数 |
+
+### DiscardPile（弃牌堆实体）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| Cards | []Card | 已打出的牌（按打出顺序排列） |
+| TopCard | Card | 最上面一张牌（最近打出） |
+
+### GameState（游戏状态实体）
+
+GameState 是游戏运行时的核心聚合，包含所有运行时状态。
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| Deck | Deck | 牌库 |
+| DiscardPile | DiscardPile | 弃牌堆 |
+| Turn | TurnState | 回合状态 |
+| ActionStack | ActionStack | 动作栈（Nope 链） |
+| Phase | GamePhase | 游戏阶段 |
+| Players | []PlayerInfo | 玩家公开信息（不含手牌） |
+| RoundCount | int | 当前回合数 |
+
+### PlayerInfo（玩家公开信息）
+
+对局中每个玩家对其他玩家可见的信息。
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| ID | string | 玩家 ID |
+| Nickname | string | 玩家昵称 |
+| HandSize | int | 手牌张数（不显示具体牌） |
+| Alive | bool | 是否存活 |
+| DefuseCount | int | 拆解牌数量（部分可见） |
+
+### TurnState（回合状态实体）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| CurrentPlayerID | string | 当前回合玩家 ID |
+| PlayerOrder | []string | 存活玩家座位顺序 |
+| Direction | int | 回合方向（1=顺时针，-1=逆时针） |
+| PendingDraws | int | 攻击牌累积的待抽牌数 |
+| Phase | TurnPhase | 回合阶段 |
+| ActionsTaken | int | 本轮已出牌数 |
+
+### ActionStack（动作栈实体）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| Stack | []StackEntry | 动作栈条目列表 |
+| NopeWindowEnd | int64 | Nope 窗口结束时间戳 |
+
+### StackEntry（动作栈条目）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| Action | Action | 原始动作 |
+| ActorID | string | 发起者玩家 ID |
+| Timestamp | int64 | 入栈时间戳 |
+
+### Action（动作值对象）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| Type | ActionType | 动作类型 |
+| CardIDs | []string | 动作涉及的卡牌 ID |
+| TargetPlayerID | string | 目标玩家 ID（选填） |
+| TargetCardType | CardType | 目标卡牌类型（选填） |
+
+### ActionType（动作类型枚举）
+
+| 枚举值 | 含义 | 说明 |
+|-|-|-|
+| PlayCard | 出牌 | 打出一张或多张牌 |
+| Nope | 出否决 | 在 Nope 窗口内打出 Nope |
+| DrawCard | 抽牌 | 从牌库抽一张牌 |
+| EndTurn | 结束回合 | 主动结束出牌阶段 |
+| SelectTarget | 选择目标 | 选牌/选人的响应 |
+
+## 6.4 数据传输对象（DTO）
+
+DTO 用于客户端与服务器之间的消息传递，不包含业务逻辑，仅做数据载体。
+
+### RoomDTO（房间数据传输对象）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| RoomID | string | 房间 ID |
+| Players | []PlayerDTO | 玩家列表 |
+| Status | string | 房间状态 |
+| Settings | RoomSettings | 房间设置 |
+
+### PlayerDTO（玩家数据传输对象）
+
+| 字段 | 类型 | 说明 |
+|-|-|-|
+| ID | string | 玩家 ID |
+| Nickname | string | 昵称 |
+| HandSize | int | 手牌张数 |
+| Alive | bool | 存活状态 |
+| IsReady | bool | 准备状态 |
+| IsOwner | bool | 是否房主 |
+
+### GameStateDTO（游戏状态数据传输对象）
+
+
+
+
+
+# 七、后端接口设计
+
+## 7.1 接口分类
+
+后端接口分为两类：**HTTP RESTful 接口**和 **WebSocket 消息接口**。
+
+| 接口类型 | 用途 | 传输协议 | 数据格式 |
+|-|-|-|-|
+| HTTP RESTful | 房间管理、用户认证、数据查询 | HTTP/1.1 | JSON |
+| WebSocket | 游戏核心操作、状态推送、实时事件 | WebSocket | JSON |
+
+## 7.2 HTTP 接口设计
+
+### 接口基础信息
+
+- **Base URL**: `/api/v1`
+- **Content-Type**: `application/json`
+- **认证方式**: Bearer Token（除注册/登录外）
+- **统一响应格式**:
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": { }
+}
+```
+
+### 用户认证接口
+
+#### POST /api/v1/auth/register
+
+注册新用户。
+
+| 参数 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| nickname | string | 是 | 玩家昵称（2-16 字符） |
+| password | string | 是 | 密码（6-32 字符） |
+
+```json
+// Response
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "user_id": "u_abc123",
+    "token": "eyJhbGciOiJIUzI1NiIs..."
+  }
+}
+```
+
+#### POST /api/v1/auth/login
+
+用户登录。
+
+| 参数 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| user_id | string | 是 | 用户 ID |
+| password | string | 是 | 密码 |
+
+```json
+// Response
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "token": "eyJhbGciOiJIUzI1NiIs...",
+    "expires_at": 1712345678
+  }
+}
+```
+
+#### POST /api/v1/auth/refresh
+
+刷新 Token。
+
+| 参数 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| token | string | 是 | 当前 Token |
+
+### 房间接口
+
+#### POST /api/v1/rooms
+
+创建房间。
+
+| 参数 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| name | string | 否 | 房间名称（默认 "新建房间"） |
+| max_players | int | 否 | 最大玩家数（默认 5，范围 2-5） |
+
+```json
+// Response
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "room_id": "r_xyz789",
+    "invite_code": "A1B2C3",
+    "name": "欢乐局",
+    "max_players": 5,
+    "status": "waiting"
+  }
+}
+```
+
+#### GET /api/v1/rooms/{room_id}
+
+查询房间详情（含玩家列表）。
+
+```json
+// Response
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "room_id": "r_xyz789",
+    "invite_code": "A1B2C3",
+    "name": "欢乐局",
+    "status": "waiting",
+    "max_players": 5,
+    "players": [
+      {"id": "u_abc", "nickname": "玩家A", "is_ready": true, "is_owner": true},
+      {"id": "u_def", "nickname": "玩家B", "is_ready": false, "is_owner": false}
+    ]
+  }
+}
+```
+
+#### POST /api/v1/rooms/join
+
+通过邀请码加入房间。
+
+| 参数 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| invite_code | string | 是 | 6位邀请码 |
+
+#### POST /api/v1/rooms/{room_id}/leave
+
+退出房间。
+
+#### POST /api/v1/rooms/{room_id}/ready
+
+准备/取消准备。
+
+| 参数 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| ready | boolean | 是 | true=准备，false=取消准备 |
+
+#### POST /api/v1/rooms/{room_id}/start
+
+开始游戏（仅房主可调用，需全员准备）。
+
+### 通用错误码
+
+| code | message | 说明 |
+|-|-|-|
+| 0 | success | 操作成功 |
+| 1001 | invalid_params | 请求参数不合法 |
+| 1002 | unauthorized | 未登录或 Token 过期 |
+| 1003 | forbidden | 无权限（非房主操作等） |
+| 2001 | room_not_found | 房间不存在 |
+| 2002 | room_full | 房间已满 |
+| 2003 | room_already_started | 游戏已开始，无法加入 |
+| 2004 | not_all_ready | 未全员准备 |
+| 2005 | invalid_invite_code | 邀请码无效 |
+| 3001 | player_not_found | 玩家不存在 |
+| 3002 | player_already_in_room | 玩家已在房间中 |
+
+## 7.3 WebSocket 接口设计
+
+### 连接建立
+
+客户端通过 HTTP 升级建立 WebSocket 连接：
+
+```
+ws://<host>/ws?room_id={room_id}&token={token}
+```
+
+- room_id: 房间 ID（必填）
+- token: 认证 Token（必填）
+
+### 消息格式
+
+所有 WebSocket 消息遵循统一的 JSON 格式。
+
+**客户端 → 服务端（Request）**:
+
+```json
+{
+  "type": "string",
+  "payload": {},
+  "req_id": "string"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| type | string | 是 | 消息类型标识 |
+| payload | object | 是 | 消息体，内容随 type 变化 |
+| req_id | string | 否 | 请求 ID，用于响应追踪 |
+
+**服务端 → 客户端（Response）**:
+
+```json
+{
+  "type": "string",
+  "payload": {},
+  "req_id": "string",
+  "timestamp": 1712345678
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| type | string | 是 | 事件类型标识 |
+| payload | object | 是 | 事件体 |
+| req_id | string | 否 | 对应请求的 ID（仅响应类消息） |
+| timestamp | int64 | 是 | 服务端事件时间戳 |
+
+### 客户端请求消息
+
+#### play_card — 出牌
+
+```json
+{
+  "type": "play_card",
+  "payload": {
+    "card_ids": ["cat_01", "cat_02", "cat_03"],
+    "target_player_id": "u_002",
+    "target_card_type": "defuse"
+  }
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|-|-|-|-|
+| card_ids | []string | 是 | 打出的卡牌 ID 列表 |
+| target_player_id | string | 否 | 目标玩家 ID（索要/三张猫牌时必填） |
+| target_card_type | string | 否 | 目标卡牌类型（三张猫牌时必填） |
+
+#### draw_card — 抽牌（结束出牌阶段，进入抽牌阶段）
+
+```json
+{
+  "type": "draw_card",
+  "payload": {}
+}
+```
+
+#### play_nope — 出 Nope（在 Nope 窗口内使用）
+
+```json
+{
+  "type": "play_nope",
+  "payload": {}
+}
+```
+
+#### end_turn — 结束出牌阶段（直接进入抽牌阶段）
+
+```json
+{
+  "type": "end_turn",
+  "payload": {}
+}
+```
+
+#### select_target — 选牌响应（某些卡牌效果需要玩家选牌）
+
+```json
+{
+  "type": "select_target",
+  "payload": {
+    "card_id": "defuse_01",
+    "target_player_id": "u_003"
+  }
+}
+```
+
+### 服务端推送事件
+
+#### state_update — 游戏状态更新（核心事件，每次状态变更后推送）
+
+```json
+{
+  "type": "state_update",
+  "payload": {
+    "your_hand": [
+      {"id": "defuse_01", "type": "defuse", "name": "拆解"},
+      {"id": "skip_01", "type": "skip", "name": "跳过"}
+    ],
+    "opponents": [
+      {"id": "u_002", "nickname": "玩家B", "hand_size": 4, "alive": true, "defuse_count": 1},
+      {"id": "u_003", "nickname": "玩家C", "hand_size": 3, "alive": true, "defuse_count": 0}
+    ],
+    "discard_pile": [
+      {"id": "cat_01", "type": "cat_card", "name": "猫牌"}
+    ],
+    "deck_count": 28,
+    "current_turn": "u_001",
+    "pending_draws": 0,
+    "phase": "action",
+    "direction": 1,
+    "action_stack": [],
+    "nope_remaining_ms": 0,
+    "game_status": "playing",
+    "round_count": 3
+  }
+}
+```
+
+#### nope_prompt — Nope 弹窗提示
+
+```json
+{
+  "type": "nope_prompt",
+  "payload": {
+    "action": {
+      "actor_id": "u_001",
+      "card_ids": ["cat_01", "cat_02", "cat_03"],
+      "action_type": "play_card"
+    },
+    "remaining_ms": 3000,
+    "can_nope": true
+  }
+}
+```
+
+#### card_played — 玩家出牌通知（用于动画播放）
+
+```json
+{
+  "type": "card_played",
+  "payload": {
+    "player_id": "u_001",
+    "card_ids": ["cat_01", "cat_02", "cat_03"],
+    "action_type": "play_card"
+  }
+}
+```
+
+#### card_drawn — 玩家抽牌通知
+
+```json
+{
+  "type": "card_drawn",
+  "payload": {
+    "player_id": "u_001",
+    "card_id": "deck_028",
+    "is_exploding": false
+  }
+}
+```
+
+#### player_turn — 轮到某玩家
+
+```json
+{
+  "type": "player_turn",
+  "payload": {
+    "player_id": "u_001",
+    "phase": "action",
+    "pending_draws": 0,
+    "available_actions": ["play_card", "end_turn"]
+  }
+}
+```
+
+#### game_event — 游戏事件通知（用于展示消息提示）
+
+```json
+{
+  "type": "game_event",
+  "payload": {
+    "event": "nope_played",
+    "message": "玩家B 使用了 Nope，取消了玩家A的三张猫牌效果",
+    "actor_id": "u_002",
+    "target_id": "u_001"
+  }
+}
+```
+
+| event 枚举值 | 含义 | 触发条件 |
+|-|-|-|
+| nope_played | 有人出 Nope | Nope 牌被使用 |
+| attack_transferred | 攻击转移 | 被攻击玩家打出 Attack |
+| card_stolen | 牌被抢走 | 索要/三张猫牌生效 |
+| exploding_kitten_drawn | 抽到爆炸猫 | 玩家抽到爆炸猫 |
+| defuse_used | 使用拆解 | 抽到爆炸猫后使用拆解 |
+| player_eliminated | 玩家出局 | 玩家爆炸出局 |
+| player_reconnected | 玩家重连 | 断线玩家重新连接 |
+| see_the_future | 使用了预言 | 玩家使用预言牌 |
+| deck_shuffled | 牌库被洗牌 | 玩家使用洗牌牌 |
+
+#### player_eliminated — 玩家出局通知
+
+```json
+{
+  "type": "player_eliminated",
+  "payload": {
+    "player_id": "u_003",
+    "reason": "exploding_kitten",
+    "surviving_players": 2
+  }
+}
+```
+
+#### game_over — 游戏结束
+
+```json
+{
+  "type": "game_over",
+  "payload": {
+    "winner_id": "u_001",
+    "winner_nickname": "玩家A",
+    "players": [
+      {"id": "u_001", "nickname": "玩家A", "rank": 1, "alive": true},
+      {"id": "u_002", "nickname": "玩家B", "rank": 2, "alive": true},
+      {"id": "u_003", "nickname": "玩家C", "rank": 3, "alive": false}
+    ],
+    "duration_seconds": 480,
+    "action_log_count": 156
+  }
+}
+```
+
+#### error — 错误消息
+
+```json
+{
+  "type": "error",
+  "payload": {
+    "code": 4001,
+    "message": "非法操作：不是你的回合",
+    "req_id": "req_001"
+  }
+}
+```
+
+| code | 说明 |
+|-|-|
+| 4001 | 非法操作：不是你的回合 |
+| 4002 | 非法操作：手牌中没有指定牌 |
+| 4003 | 非法操作：组合不合法 |
+| 4004 | 非法操作：当前阶段不允许该操作 |
+| 4005 | 非法操作：目标玩家不合法 |
+| 4006 | 卡牌不存在 |
+| 5001 | 服务器内部错误 |
+| 5002 | 操作超时 |
+
+## 7.4 接口调用时序图
+
+### 游戏完整流程
+
+```
+Client A          Client B          Server
+   |                 |                |
+   |--- login -------|--------------->|  HTTP 登录
+   |<-- token -------|---------------<|
+   |                 |                |
+   |--- create room->|--------------->|  HTTP 创建房间
+   |<-- room_id -----|---------------<|
+   |                 |                |
+   |--- join room ---|--------------->|  HTTP 加入房间
+   |                 |--- join room ->|
+   |                 |<-- ok ---------|
+   |--- ready -------|--------------->|  HTTP 准备
+   |                 |--- ready ----->|
+   |                 |                |
+   |--- start game ->|--------------->|  HTTP 开始游戏（房主）
+   |                 |                |
+   |--- ws connect ->|--------------->|  WebSocket 连接
+   |                 |--- ws connect >|
+   |                 |                |
+   |<-- state_update-|----------------|  游戏状态初始推送
+   |                 |<-- state_update|
+   |                 |                |
+   |--- play_card ---|--------------->|  客户端出牌
+   |                 |<-- nope_prompt |  Nope 窗口开启
+   |                 |                |
+   |--- play_nope ---|--------------->|  其他玩家出 Nope
+   |                 |<-- nope_prompt |  Nope 窗口重置
+   |                 |                |
+   |                 |                |  Nope 窗口超时
+   |<-- state_update-|----------------|  结算结果广播
+   |                 |<-- state_update|
+   |                 |                |
+   |--- draw_card ---|--------------->|  抽牌
+   |                 |                |
+   |<-- player_turn -|----------------|  轮到下家
+   |                 |<-- player_turn |
+   |                 |                |
+   |                 |--- draw_card ->|  抽到爆炸猫
+   |                 |<-- card_drawn -|
+   |<-- game_event --|----------------|  玩家出局通知
+   |                 |<-- player_elim|
+   |                 |                |
+   |                 |                |  ... 继续游戏
+   |                 |                |
+   |<-- game_over ---|----------------|  游戏结束
+   |                 |<-- game_over --|
+   |                 |                |
+   |--- ws close ----|--------------->|  断开连接
+   |                 |--- ws close ---|
+```
+
+## 7.5 接口安全设计
+
+### 防篡改
+
+- 所有涉及手牌操作的请求，服务端从自身状态中查询玩家手牌，**不信任客户端传入的 card_ids 增量信息**
+- 客户端只能传 card_id，服务端在 Model 层校验该 card_id 是否确实属于该玩家的手牌
+- 组合技校验（三张相同、五张不同）在服务端 Model 层重新执行，不信任客户端判定
+
+### 防重放
+
+- 每个 WebSocket 消息可携带 req_id，服务端检测重复 req_id 并丢弃
+- 关键操作（出牌、抽牌）在服务端做幂等处理
+
+### 按视角过滤
+
+# 八、后端详细设计
+
+## 8.1 设计约定
+
+本文档按文件逐个说明每个文件中需要定义的**结构体（struct）、成员（field）、函数/方法（function/method）**，给出函数签名和返回值，并说明每个设计的含义。所有设计遵循以下约定：
+
+- **结构体成员**：首字母大写表示导出（public），小写表示包内私有（private）
+- **构造函数**：使用 `NewXXX` 命名，返回结构体指针
+- **接口定义**：使用 `XXXer` 或 `XXXRepository` 命名
+- **错误处理**：返回 `error` 类型，具体错误值在 `errors.go` 中定义
+- **上下文**：所有涉及 I/O 的方法第一个参数为 `context.Context`
+- **依赖注入**：所有 Service / Controller / Repository 通过构造函数注入依赖
+
+## 8.2 cmd/server/main.go
+
+应用入口，负责初始化所有依赖并启动服务。
+
+### 全局函数
+
+```go
+func main()
+```
+
+启动入口。依次执行：加载配置 → 初始化 Logger → 连接 Redis → 连接 PostgreSQL → 创建 Repository → 创建 Service → 创建 Controller → 注册路由 → 启动 HTTP 服务。
+
+```go
+func initDependencies(cfg *config.Config) (*Dependencies, error)
+```
+
+初始化所有依赖并返回依赖容器。负责组装依赖树，确保注入顺序正确。
+
+```go
+func startServer(deps *Dependencies) error
+```
+
+启动 HTTP 服务器，监听端口，处理优雅关闭（SIGINT/SIGTERM）。
+
+### 辅助结构体
+
+```go
+type Dependencies struct {
+    Config          *config.Config
+    Logger          *logger.Logger
+    Redis           *repository.RedisAdapter
+    DB              *repository.Database
+    GameService     *service.GameService
+    RoomService     *service.RoomService
+    TurnService     *service.TurnService
+    TimerService    *service.TimerService
+    AuthService     *service.AuthService
+    AuthController  *controller.AuthController
+    RoomController  *controller.RoomController
+    GameController  *controller.GameController
+    WsController    *controller.WsController
+    Router          *router.Router
+}
+```
+
+依赖容器，持有所有已初始化的组件实例，方便启动时按序初始化。
+
+## 8.3 internal/config/config.go
+
+配置管理，负责从 YAML 文件和环境变量加载配置。
+
+### 结构体
+
+```go
+type Config struct {
+    Server   ServerConfig
+    Redis    RedisConfig
+    Database DatabaseConfig
+    Auth     AuthConfig
+    Game     GameConfig
+    Log      LogConfig
+}
+```
+
+顶层配置结构体，聚合所有子配置。
+
+```go
+type ServerConfig struct {
+    Port         int    // HTTP 服务监听端口，默认 8080
+    Host         string // 监听地址，默认 0.0.0.0
+    ReadTimeout  int    // 读超时秒数
+    WriteTimeout int    // 写超时秒数
+}
+```
+
+HTTP 服务器配置。
+
+```go
+type RedisConfig struct {
+    Addr     string // Redis 地址，如 "localhost:6379"
+    Password string // Redis 密码
+    DB       int    // Redis 数据库编号
+    PoolSize int    // 连接池大小
+    TTL      int    // 游戏状态快照 TTL 秒数
+}
+```
+
+Redis 连接配置。
+
+```go
+type DatabaseConfig struct {
+    DSN             string // PostgreSQL 连接字符串
+    MaxOpenConns    int    // 最大打开连接数
+    MaxIdleConns    int    // 最大空闲连接数
+    ConnMaxLifetime int    // 连接最大存活秒数
+}
+```
+
+PostgreSQL 数据库配置。
+
+```go
+type AuthConfig struct {
+    JWTSecret     string // JWT 签名密钥
+    TokenExpiry   int    // Token 过期时间（小时）
+    RefreshExpiry int    // 刷新 Token 过期时间（小时）
+}
+```
+
+认证配置，JWT 相关参数。
+
+```go
+type GameConfig struct {
+    MaxPlayers       int // 最大玩家数
+    DefaultTurnTimeout int // 默认回合超时秒数
+    NopeWindowSec    int // Nope 等待窗口秒数
+    ReconnectTimeout int // 断线重连等待秒数
+}
+```
+
+游戏规则配置。
+
+```go
+type LogConfig struct {
+    Level  string // 日志级别：debug/info/warn/error
+    Format string // 日志格式：json/text
+    Output string // 输出目标：stdout/file
+}
+```
+
+日志配置。
+
+### 全局函数
+
+```go
+func LoadConfig(path string) (*Config, error)
+```
+
+加载配置文件。从指定 YAML 文件读取，环境变量覆盖同名配置项。
+
+## 8.4 internal/model/card.go
+
+卡牌核心模型，定义卡牌类型枚举和 Card 值对象。
+
+### 类型定义
+
+```go
+type CardType string
+
+const (
+    CardTypeExplodingKitten CardType = "exploding_kitten"
+    CardTypeDefuse          CardType = "defuse"
+    CardTypeSkip            CardType = "skip"
+    CardTypeAttack          CardType = "attack"
+    CardTypeFavor           CardType = "favor"
+    CardTypeShuffle         CardType = "shuffle"
+    CardTypeSeeTheFuture    CardType = "see_the_future"
+    CardTypeNope            CardType = "nope"
+    CardTypeCatCard         CardType = "cat_card"
+)
+```
+
+卡牌类型枚举，定义游戏中所有卡牌种类。
+
+### 结构体
+
+```go
+type Card struct {
+    ID          string   // 全局唯一标识，如 "cat_001"
+    Type        CardType // 卡牌类型
+    Name        string   // 展示名称，如 "三张猫牌"
+    Description string   // 效果描述文字
+}
+```
+
+卡牌值对象，不可变。创建后字段不修改，在牌库/手牌/弃牌堆之间流转。
+
+### 全局函数
+
+```go
+func NewCard(cardType CardType, id string) Card
+```
+
+创建一张新卡牌。根据类型自动填充 Name 和 Description。
+
+```go
+func GetCardTypeName(cardType CardType) string
+```
+
+获取卡牌类型的中文展示名称。
+
+```go
+func IsCatCard(cardType CardType) bool
+```
+
+判断是否为猫牌类型（用于组合技校验）。
+
+```go
+func IsStackable(cardType CardType) bool
+```
+
+判断该类型牌是否能进入动作栈（Nope、三张猫牌等）。
+
+## 8.5 internal/model/deck.go
+
+牌库引擎，管理牌库的初始化、洗牌、抽牌、插牌等操作。
+
+### 结构体
+
+```go
+type Deck struct {
+    Cards []Card // 牌库中的牌，Cards[0] = 牌顶
+    Count int    // 剩余牌数（冗余字段，快速获取）
+}
+```
+
+牌库实体，表示有序的卡牌队列。
+
+### 方法
+
+```go
+func NewDeck(cards []Card) *Deck
+```
+
+创建牌库实例，初始化为指定卡牌列表。
+
+```go
+func NewStandardDeck(playerCount int) *Deck
+```
+
+创建标准牌局牌库。根据玩家数量自动计算各类型卡牌数量，生成初始牌库。
+
+```go
+func (d *Deck) Shuffle()
+```
+
+洗牌，随机打乱牌库顺序。
+
+```go
+func (d *Deck) Draw() (Card, error)
+```
+
+从牌顶抽一张牌。返回 Card 和剩余牌数。牌库为空时返回错误。
+
+```go
+func (d *Deck) DrawMultiple(count int) ([]Card, error)
+```
+
+从牌顶连续抽多张牌。返回 Card 切片。牌库不足时返回错误。
+
+```go
+func (d *Deck) InsertAt(card Card, index int) error
+```
+
+将指定卡牌插入牌库的指定位置。index=0 为牌顶，index=-1 为牌底。
+
+```go
+func (d *Deck) PeekTop(count int) ([]Card, error)
+```
+
+偷看牌库顶 N 张牌但不移除（用于预言牌效果）。返回卡牌切片，不修改牌库。
+
+```go
+func (d *Deck) Cut(index int) error
+```
+
+切牌，将牌库从指定位置分成两半并交换顺序。
+
+```go
+func (d *Deck) IsEmpty() bool
+```
+
+判断牌库是否为空。
+
+## 8.6 internal/model/hand.go
+
+手牌操作，管理玩家手牌的增删和组合校验。
+
+### 结构体
+
+```go
+type Hand struct {
+    PlayerID string // 所属玩家 ID
+    Cards    []Card // 手牌列表，有序
+}
+```
+
+手牌实体，表示一个玩家持有的所有卡牌。
+
+### 方法
+
+```go
+func NewHand(playerID string) *Hand
+```
+
+创建空手牌实例。
+
+```go
+func (h *Hand) AddCard(card Card)
+```
+
+向手牌中添加一张牌（通常是抽牌或获得牌）。
+
+```go
+func (h *Hand) AddCards(cards []Card)
+```
+
+批量添加卡牌到手牌。
+
+```go
+func (h *Hand) RemoveCard(cardID string) (Card, error)
+```
+
+从手牌中移除指定 ID 的卡牌。返回被移除的 Card。卡牌不存在时返回错误。
+
+```go
+func (h *Hand) RemoveCards(cardIDs []string) ([]Card, error)
+```
+
+批量移除卡牌，返回被移除的 Card 切片。任一卡牌不存在时回滚并返回错误。
+
+```go
+func (h *Hand) HasCard(cardID string) bool
+```
+
+判断手牌中是否存在指定 ID 的卡牌。
+
+```go
+func (h *Hand) HasCardType(cardType CardType) bool
+```
+
+判断手牌中是否存在指定类型的卡牌。
+
+```go
+func (h *Hand) FindCardByType(cardType CardType) (Card, error)
+```
+
+按类型查找手牌中的第一张匹配牌。未找到时返回错误。
+
+```go
+func (h *Hand) GetCard(cardID string) (Card, error)
+```
+
+按 ID 获取手牌中的卡牌，不移除。未找到时返回错误。
+
+```go
+func (h *Hand) Count() int
+```
+
+获取手牌张数。
+
+```go
+func (h *Hand) ValidateCatCombo(cardIDs []string) error
+```
+
+校验三张猫牌组合：三张 ID 不同且类型相同。校验失败返回错误。
+
+```go
+func (h *Hand) ValidateFiveFlavor(cardIDs []string) error
+```
+
+校验五张不同猫牌组合：五张卡牌类型各不相同，且每张都是猫牌类型。
+
+```go
+func (h *Hand) GetCardIDs() []string
+```
+
+获取手牌中所有卡牌的 ID 列表（用于序列化时过滤）。
+
+## 8.7 internal/model/player.go
+
+玩家模型，定义玩家状态和属性。
+
+### 结构体
+
+```go
+type Player struct {
+    ID               string           // 玩家唯一标识
+    Nickname         string           // 玩家昵称
+    Hand             *Hand            // 玩家手牌
+    Alive            bool             // 是否存活
+    DefuseCount      int              // 持有的拆解牌数量
+    ConnectionStatus ConnectionStatus // 连接状态
+    IsReady          bool             // 是否已准备（等待阶段）
+    JoinedAt         int64            // 加入房间时间戳
+}
+```
+
+玩家实体，包含玩家的所有属性和状态。
+
+### 方法
+
+```go
+func NewPlayer(id string, nickname string) *Player
+```
+
+创建新玩家实例，初始存活、手牌为空、未准备。
+
+```go
+func (p *Player) IsAlive() bool
+```
+
+判断玩家是否存活。
+
+```go
+func (p *Player) Eliminate()
+```
+
+将玩家标记为出局，清空手牌。
+
+```go
+func (p *Player) UseDefuse()
+```
+
+使用一张拆解牌，DefuseCount 减 1。
+
+```go
+func (p *Player) AddDefuse()
+```
+
+获得一张拆解牌，DefuseCount 加 1。
+
+```go
+func (p *Player) SetReady(ready bool)
+```
+
+设置准备状态。
+
+```go
+func (p *Player) SetConnected(status ConnectionStatus)
+```
+
+设置连接状态。
+
+```go
+func (p *Player) ToPlayerInfo() PlayerInfo
+```
+
+转换为 PlayerInfo（公开信息，不含手牌详情）。
+
+## 8.8 internal/model/game.go
+
+游戏状态聚合根，聚合牌库、弃牌堆、回合、动作栈等所有运行时状态。
+
+### 结构体
+
+```go
+type GameState struct {
+    Deck        Deck           // 牌库
+    DiscardPile DiscardPile    // 弃牌堆
+    Turn        TurnState      // 回合状态
+    ActionStack ActionStack    // 动作栈
+    Phase       GamePhase      // 游戏阶段
+    Players     []PlayerInfo   // 玩家公开信息列表
+    RoundCount  int            // 当前回合数
+}
+```
+
+游戏状态聚合根，持有游戏运行所需的所有状态。
+
+### 方法
+
+```go
+func NewGameState(players []Player, deck Deck) *GameState
+```
+
+创建初始游戏状态，从玩家列表和牌库初始化。
+
+```go
+func (gs *GameState) GetPlayerHand(playerID string) (*Hand, error)
+```
+
+获取指定玩家的手牌引用。玩家不存在时返回错误。
+
+```go
+func (gs *GameState) GetPlayerInfo(playerID string) (PlayerInfo, error)
+```
+
+获取指定玩家的公开信息。玩家不存在时返回错误。
+
+```go
+func (gs *GameState) GetAlivePlayers() []PlayerInfo
+```
+
+获取所有存活玩家的公开信息列表。
+
+```go
+func (gs *GameState) GetAliveCount() int
+```
+
+获取存活玩家人数。
+
+```go
+func (gs *GameState) IsGameOver() bool
+```
+
+判断游戏是否结束（存活人数 ≤ 1）。
+
+```go
+func (gs *GameState) GetWinner() (PlayerInfo, error)
+```
+
+获取获胜者。游戏未结束时返回错误。
+
+```go
+func (gs *GameState) AdvanceRound()
+```
+
+回合数加 1。
+
+## 8.9 internal/model/turn.go
+
+回合调度器，管理回合轮转、方向、攻击累积。
+
+### 结构体
+
+```go
+type TurnState struct {
+    CurrentPlayerID string   // 当前回合玩家 ID
+    PlayerOrder     []string // 存活玩家座位顺序
+    Direction       int      // 回合方向 1=顺时针 -1=逆时针
+    PendingDraws    int      // 攻击牌累积的待抽牌数
+    Phase           TurnPhase // 回合阶段
+    ActionsTaken    int      // 本轮已出牌数
+}
+```
+
+回合状态实体，表示当前回合的完整状态。
+
+### 方法
+
+```go
+func NewTurnState(players []string) *TurnState
+```
+
+创建初始回合状态，从存活玩家 ID 列表初始化。
+
+```go
+func (ts *TurnState) NextPlayer() string
+```
+
+获取下一个存活玩家的 ID（环形遍历，考虑方向）。
+
+```go
+func (ts *TurnState) AdvanceTurn()
+```
+
+推进回合到下一个玩家，待抽牌数清零，出牌计数重置，阶段设为 Action。
+
+```go
+func (ts *TurnState) OnSkip()
+```
+
+处理 Skip 牌效果：当前玩家跳过，轮到下家。
+
+```go
+func (ts *TurnState) OnAttack()
+```
+
+处理 Attack 牌效果：待抽牌数 +2，轮到下家，下家直接进入抽牌阶段。
+
+```go
+func (ts *TurnState) OnCardDrawn()
+```
+
+处理抽牌效果：待抽牌数减 1。待抽牌数归零时自动推进到下家出牌阶段。
+
+```go
+func (ts *TurnState) OnActionTaken()
+```
+
+出牌计数加 1。
+
+```go
+func (ts *TurnState) ReverseDirection()
+```
+
+反转回合方向（处理转向效果）。
+
+```go
+func (ts *TurnState) RemovePlayer(playerID string)
+```
+
+移除出局玩家。如果当前玩家是出局者，自动推进到下家。
+
+```go
+func (ts *TurnState) SetPhase(phase TurnPhase)
+```
+
+设置回合阶段。
+
+```go
+func (ts *TurnState) IsPlayerTurn(playerID string) bool
+```
+
+判断是否是指定玩家的回合。
+
+## 8.10 internal/model/action.go
+
+动作栈（Nope 链）核心实现，管理动作入栈、Nope 抵消和结算。
+
+### 结构体
+
+```go
+type ActionStack struct {
+    Stack         []StackEntry // 动作栈条目列表
+    NopeWindowEnd int64        // Nope 窗口截止时间戳（Unix 毫秒）
+}
+```
+
+动作栈实体，管理 Nope 链的入栈和结算。
+
+### 方法
+
+```go
+func NewActionStack() *ActionStack
+```
+
+创建空动作栈。
+
+```go
+func (as *ActionStack) Push(entry StackEntry)
+```
+
+将新动作入栈。非 Nope 动作会先清空栈再入栈；Nope 动作追加到栈顶。
+
+```go
+func (as *ActionStack) Pop() (StackEntry, error)
+```
+
+弹出栈顶条目。栈为空时返回错误。
+
+```go
+func (as *ActionStack) Peek() (StackEntry, error)
+```
+
+查看栈顶条目但不弹出。栈为空时返回错误。
+
+```go
+func (as *ActionStack) Resolve() ResolveResult
+```
+
+结算动作栈。从栈底向上遍历，统计 Nope 数量（奇偶抵消），返回最终结果。
+
+```go
+func (as *ActionStack) TopIsNope() bool
+```
+
+判断栈顶是否为 Nope 动作。
+
+```go
+func (as *ActionStack) IsEmpty() bool
+```
+
+判断动作栈是否为空。
+
+```go
+func (as *ActionStack) Clear()
+```
+
+清空动作栈。
+
+```go
+func (as *ActionStack) SetNopeWindow(deadline int64)
+```
+
+设置 Nope 窗口截止时间。
+
+```go
+func (as *ActionStack) HasNopeWindowExpired(now int64) bool
+```
+
+判断 Nope 窗口是否已过期。
+
+```go
+func (as *ActionStack) GetBaseAction() (StackEntry, error)
+```
+
+获取栈底原始动作（非 Nope 的原始出牌动作）。
+
+### 辅助结构体
+
+```go
+type StackEntry struct {
+    Action    Action // 动作内容
+    ActorID   string // 发起者玩家 ID
+    Timestamp int64  // 入栈时间戳
+}
+```
+
+动作栈条目，记录动作本身和发起者。
+
+```go
+type ResolveResult struct {
+    Action        Action // 原始动作
+    ActionBlocked bool   // 动作是否被 Nope 抵消
+    NopeCount     int    // Nope 总数量
+    NopeActors    []string // 出 Nope 的玩家 ID 列表
+}
+```
+
+结算结果，包含是否被抵消、Nope 数量等信息。
+
+```go
+type Action struct {
+    Type            ActionType // 动作类型
+    CardIDs         []string   // 涉及的卡牌 ID
+    TargetPlayerID  string     // 目标玩家 ID（选填）
+    TargetCardType  CardType   // 目标卡牌类型（选填）
+}
+```
+
+动作值对象，描述一个玩家动作。
+
+### 类型定义
+
+```go
+type ActionType string
+
+const (
+    ActionPlayCard      ActionType = "play_card"
+    ActionNope          ActionType = "nope"
+    ActionDrawCard      ActionType = "draw_card"
+    ActionEndTurn       ActionType = "end_turn"
+    ActionSelectTarget  ActionType = "select_target"
+)
+```
+
+动作类型枚举，定义玩家可以执行的所有动作类型。
+
+## 8.11 internal/model/room.go
+
+房间模型，管理房间实体、玩家列表和游戏生命周期。
+
+### 结构体
+
+```go
+type Room struct {
+    ID        string       // 房间唯一标识
+    Name      string       // 房间名称
+    InviteCode string      // 6位邀请码
+    OwnerID   string       // 房主玩家 ID
+    Players   []*Player    // 房间内所有玩家
+    GameState *GameState   // 当前游戏状态（nil 表示未开始）
+    Status    GamePhase    // 房间生命周期状态
+    Settings  RoomSettings // 房间设置
+    CreatedAt int64        // 创建时间戳
+    Inbox     chan Message // 玩家消息汇入通道
+}
+```
+
+房间实体，游戏的顶层容器。
+
+### 方法
+
+```go
+func NewRoom(id string, name string, ownerID string, settings RoomSettings) *Room
+```
+
+创建新房间，设置房主、初始化状态为 Waiting。
+
+```go
+func (r *Room) AddPlayer(player *Player) error
+```
+
+添加玩家到房间。房间已满或游戏已开始时返回错误。
+
+```go
+func (r *Room) RemovePlayer(playerID string) error
+```
+
+从房间移除玩家。玩家不在房间中时返回错误。
+
+```go
+func (r *Room) GetPlayer(playerID string) (*Player, error)
+```
+
+获取指定玩家引用。玩家不存在时返回错误。
+
+```go
+func (r *Room) AllReady() bool
+```
+
+判断是否所有玩家都已准备。
+
+```go
+func (r *Room) StartGame() error
+```
+
+开始游戏。未全员准备或游戏已开始时返回错误。
+
+```go
+func (r *Room) IsFull() bool
+```
+
+判断房间是否已满。
+
+```go
+func (r *Room) IsEmpty() bool
+```
+
+判断房间是否无人。
+
+```go
+func (r *Room) IsOwner(playerID string) bool
+```
+
+判断指定玩家是否为房主。
+
+```go
+func (r *Room) TransferOwnership()
+```
+
+房主退出时转移房主给下一个玩家。
+
+```go
+func (r *Room) Run(ctx context.Context)
+```
+
+房间主循环。从 Inbox 读取消息，串行处理所有玩家动作和超时事件。
+
+```go
+func (r *Room) HandleMessage(msg Message)
+```
+
+消息分发入口。根据消息类型路由到对应的处理方法。
+
+```go
+func (r *Room) BroadcastState(broadcaster Broadcaster)
+```
+
+广播当前状态给所有玩家。
+
+```go
+func (r *Room) SerializeFor(playerID string) *GameStateDTO
+```
+
+按玩家视角序列化游戏状态。
+
+```go
+func (r *Room) ToRoomDTO() *RoomDTO
+```
+
+转换为 RoomDTO（用于 HTTP 接口返回）。
+
+### 辅助结构体
+
+```go
+type RoomSettings struct {
+    MaxPlayers       int // 最大玩家数，默认 5
+    TurnTimeout      int // 回合超时秒数，默认 60
+    NopeWindowSec    int // Nope 等待窗口秒数，默认 3
+    ReconnectTimeout int // 断线重连等待秒数，默认 90
+}
+```
+
+房间设置，可自定义的配置项。
+
+```go
+type Message struct {
+    Type     string      // 消息类型
+    Payload  interface{} // 消息体
+    PlayerID string      // 发送者玩家 ID
+    ReqID    string      // 请求 ID（可选）
+}
+```
+
+房间消息体，封装来自玩家的请求。
+
+## 8.12 internal/model/errors.go
+
+领域错误定义，集中管理所有错误类型。
+
+### 类型定义
+
+```go
+type GameError struct {
+    Code    int    // 错误码
+    Message string // 错误描述
+}
+```
+
+游戏错误类型，包含错误码和描述。
+
+### 错误变量
+
+```go
+var (
+    ErrCardNotFound          = &GameError{Code: 4001, Message: "卡牌不存在"}
+    ErrInvalidCardCombo      = &GameError{Code: 4002, Message: "卡牌组合不合法"}
+    ErrNotYourTurn           = &GameError{Code: 4003, Message: "不是你的回合"}
+    ErrWrongPhase            = &GameError{Code: 4004, Message: "当前阶段不允许该操作"}
+    ErrInvalidTarget         = &GameError{Code: 4005, Message: "目标玩家不合法"}
+    ErrRoomFull              = &GameError{Code: 4006, Message: "房间已满"}
+    ErrRoomNotFound          = &GameError{Code: 4007, Message: "房间不存在"}
+    ErrGameAlreadyStarted    = &GameError{Code: 4008, Message: "游戏已开始"}
+    ErrNotAllReady           = &GameError{Code: 4009, Message: "未全员准备"}
+    ErrPlayerNotFound        = &GameError{Code: 4010, Message: "玩家不存在"}
+    ErrPlayerAlreadyInRoom   = &GameError{Code: 4011, Message: "玩家已在房间中"}
+    ErrDeckEmpty             = &GameError{Code: 4012, Message: "牌库为空"}
+    ErrInvalidInviteCode     = &GameError{Code: 4013, Message: "邀请码无效"}
+    ErrNopeWindowClosed      = &GameError{Code: 4014, Message: "Nope 窗口已关闭"}
+    ErrCannotNopeNow         = &GameError{Code: 4015, Message: "当前不可出 Nope"}
+    ErrPlayerEliminated      = &GameError{Code: 4016, Message: "玩家已出局"}
+)
+```
+
+预定义领域错误，每个错误包含唯一错误码和描述信息。
+
+### 方法
+
+```go
+func (e *GameError) Error() string
+```
+
+实现 error 接口，返回错误描述。
+
+```go
+func (e *GameError) WithMessage(msg string) *GameError
+```
+
+在当前错误基础上附加额外上下文信息。
+
+## 8.13 internal/repository/interfaces.go
+
+Repository 接口定义，实现依赖倒置。
+
+### 接口定义
+
+```go
+type GameStateRepository interface {
+    SaveGameState(ctx context.Context, roomID string, state *GameState) error
+    GetGameState(ctx context.Context, roomID string) (*GameState, error)
+    DeleteGameState(ctx context.Context, roomID string) error
+}
+```
+
+游戏状态仓库接口。保存/获取/删除游戏状态快照。
+
+```go
+type PlayerRepository interface {
+    CreatePlayer(ctx context.Context, player *Player) error
+    GetPlayer(ctx context.Context, playerID string) (*Player, error)
+    GetPlayerByNickname(ctx context.Context, nickname string) (*Player, error)
+    UpdatePlayer(ctx context.Context, player *Player) error
+}
+```
+
+玩家仓库接口。玩家信息的增删改查。
+
+```go
+type GameRecordRepository interface {
+    SaveGameRecord(ctx context.Context, record *GameRecord) error
+    GetGameRecord(ctx context.Context, recordID string) (*GameRecord, error)
+    GetPlayerHistory(ctx context.Context, playerID string, limit int) ([]*GameRecord, error)
+    GetLeaderboard(ctx context.Context, limit int) ([]*LeaderboardEntry, error)
+}
+```
+
+游戏记录仓库接口。历史对局和排行榜的持久化。
+
+## 8.14 internal/repository/redis.go
+
+Redis 实现：游戏状态快照的读写和 TTL 管理。
+
+### 结构体
+
+```go
+type RedisAdapter struct {
+    client *redis.Client
+    ttl    time.Duration
+}
+```
+
+Redis 适配器，封装 go-redis 客户端，提供游戏状态存取。
+
+### 方法
+
+```go
+func NewRedisAdapter(cfg *RedisConfig) (*RedisAdapter, error)
+```
+
+创建 Redis 连接，测试连通性。连接失败时返回错误。
+
+```go
+func (r *RedisAdapter) SaveGameState(ctx context.Context, roomID string, state *GameState) error
+```
+
+实现 GameStateRepository 接口。将游戏状态序列化为 JSON，写入 Redis，设置 TTL。
+
+```go
+func (r *RedisAdapter) GetGameState(ctx context.Context, roomID string) (*GameState, error)
+```
+
+实现 GameStateRepository 接口。从 Redis 读取 JSON，反序列化为 GameState。
+
+```go
+func (r *RedisAdapter) DeleteGameState(ctx context.Context, roomID string) error
+```
+
+实现 GameStateRepository 接口。删除 Redis 中的游戏状态 key。
+
+```go
+func (r *RedisAdapter) Close() error
+```
+
+关闭 Redis 连接。
+
+## 8.15 internal/repository/postgres.go
+
+PostgreSQL 实现：用户信息、战绩、历史记录的持久化。
+
+### 结构体
+
+```go
+type Database struct {
+    db *sql.DB
+}
+```
+
+数据库适配器，封装 database/sql，提供关系型数据存取。
+
+### 方法
+
+```go
+func NewDatabase(cfg *DatabaseConfig) (*Database, error)
+```
+
+创建 PostgreSQL 连接池，测试连通性。连接失败时返回错误。
+
+```go
+func (d *Database) CreatePlayer(ctx context.Context, player *Player) error
+```
+
+实现 PlayerRepository 接口。插入玩家记录。
+
+```go
+func (d *Database) GetPlayer(ctx context.Context, playerID string) (*Player, error)
+```
+
+实现 PlayerRepository 接口。按 ID 查询玩家。
+
+```go
+func (d *Database) GetPlayerByNickname(ctx context.Context, nickname string) (*Player, error)
+```
+
+实现 PlayerRepository 接口。按昵称查询玩家（用于登录校验）。
+
+```go
+func (d *Database) UpdatePlayer(ctx context.Context, player *Player) error
+```
+
+实现 PlayerRepository 接口。更新玩家信息（战绩等）。
+
+```go
+func (d *Database) SaveGameRecord(ctx context.Context, record *GameRecord) error
+```
+
+实现 GameRecordRepository 接口。插入游戏记录。
+
+```go
+func (d *Database) GetGameRecord(ctx context.Context, recordID string) (*GameRecord, error)
+```
+
+实现 GameRecordRepository 接口。按 ID 查询游戏记录。
+
+```go
+func (d *Database) GetPlayerHistory(ctx context.Context, playerID string, limit int) ([]*GameRecord, error)
+```
+
+实现 GameRecordRepository 接口。查询玩家历史对局记录。
+
+```go
+func (d *Database) GetLeaderboard(ctx context.Context, limit int) ([]*LeaderboardEntry, error)
+```
+
+实现 GameRecordRepository 接口。查询排行榜（按胜率或胜场排序）。
+
+```go
+func (d *Database) Close() error
+```
+
+关闭数据库连接池。
+
+### 辅助结构体
+
+```go
+type GameRecord struct {
+    ID          string    // 记录 ID
+    RoomID      string    // 房间 ID
+    Players     []string  // 参与玩家 ID 列表
+    WinnerID    string    // 获胜者 ID
+    StartedAt   time.Time // 开始时间
+    FinishedAt  time.Time // 结束时间
+    DurationSec int       // 对局时长
+    ActionLog   []byte    // 操作日志 JSON
+    CreatedAt   time.Time // 创建时间
+}
+```
+
+游戏记录实体，存储一局游戏的完整信息。
+
+```go
+type LeaderboardEntry struct {
+    PlayerID   string // 玩家 ID
+    Nickname   string // 玩家昵称
+    GamesPlayed int   // 总局数
+    GamesWon   int    // 胜场
+    WinRate    float64 // 胜率
+    TotalScore int    // 总分
+}
+```
+
+排行榜条目，展示玩家排名和战绩。
+
+## 8.16 internal/repository/cache.go
+
+本地缓存抽象层，提供内存缓存接口。
+
+### 结构体
+
+```go
+type Cache struct {
+    data map[string]interface{}
+    mu   sync.RWMutex
+    ttl  time.Duration
+}
+```
+
+本地内存缓存，线程安全，支持 TTL 过期。
+
+### 方法
+
+```go
+func NewCache(ttl time.Duration) *Cache
+```
+
+创建缓存实例，设置默认 TTL。
+
+```go
+func (c *Cache) Get(key string) (interface{}, error)
+```
+
+获取缓存值。key 不存在或已过期时返回错误。
+
+```go
+func (c *Cache) Set(key string, value interface{})
+```
+
+设置缓存值，使用默认 TTL。
+
+```go
+func (c *Cache) SetWithTTL(key string, value interface{}, ttl time.Duration)
+```
+
+设置缓存值并指定 TTL。
+
+```go
+func (c *Cache) Delete(key string)
+```
+
+删除缓存值。
+
+```go
+func (c *Cache) Clear()
+```
+
+清空所有缓存。
+
+## 8.17 internal/service/game_service.go
+
+游戏服务，编排出牌、抽牌、Nope 结算等核心游戏流程。
+
+### 结构体
+
+```go
+type GameService struct {
+    roomRepo      GameStateRepository
+    turnService   *TurnService
+    timerService  *TimerService
+    broadcaster   Broadcaster
+}
+```
+
+游戏服务，依赖 Repository 和 TimerService 编排游戏流程。
+
+### 方法
+
+```go
+func NewGameService(roomRepo GameStateRepository, turnService *TurnService, timerService *TimerService, broadcaster Broadcaster) *GameService
+```
+
+创建游戏服务实例，注入依赖。
+
+```go
+func (s *GameService) HandlePlayCard(room *Room, playerID string, cardIDs []string, targetPlayerID string, targetCardType CardType) (*GameStateDTO, error)
+```
+
+处理出牌请求。校验合法性 → 移除手牌 → 入弃牌堆 → 执行效果 → 入动作栈 → 开启 Nope 窗口 → 返回新状态。
+
+```go
+func (s *GameService) HandleDrawCard(room *Room, playerID string) (*GameStateDTO, error)
+```
+
+处理抽牌请求。从牌库抽牌 → 检查是否爆炸猫 → 若是则触发拆解/出局 → 更新回合状态 → 返回新状态。
+
+```go
+func (s *GameService) HandlePlayNope(room *Room, playerID string) (*GameStateDTO, error)
+```
+
+处理出 Nope 请求。校验 Nope 窗口是否开启 → 入动作栈 → 重置 Nope 窗口 → 返回新状态。
+
+```go
+func (s *GameService) HandleEndTurn(room *Room, playerID string) (*GameStateDTO, error)
+```
+
+处理结束回合请求。进入抽牌阶段 → 返回新状态。
+
+```go
+func (s *GameService) HandleSelectTarget(room *Room, playerID string, cardID string, targetPlayerID string) (*GameStateDTO, error)
+```
+
+处理选牌响应。校验目标合法性 → 执行索要牌/三张猫牌效果 → 返回新状态。
+
+```go
+func (s *GameService) ResolveNopeWindow(room *Room) (*GameStateDTO, error)
+```
+
+结算 Nope 窗口。Drain 积压消息 → 检查栈顶 → 若栈顶为 Nope 则重置窗口 → 否则执行最终结算。
+
+```go
+func (s *GameService) HandleTimeout(room *Room) (*GameStateDTO, error)
+```
+
+处理回合超时。自动执行默认操作（跳过或随机出牌）→ 推进回合 → 返回新状态。
+
+```go
+func (s *GameService) ExecuteCardEffect(room *Room, action Action, actorID string) error
+```
+
+执行卡牌效果。根据 ActionType 分发到 Skip/Attack/Favor/Shuffle/SeeTheFuture/组合技等具体效果处理器。
+
+## 8.18 internal/service/room_service.go
+
+房间服务，管理房间的创建、加入、退出、开始游戏等生命周期。
+
+### 结构体
+
+```go
+type RoomService struct {
+    rooms      map[string]*Room  // 房间池 roomID -> Room
+    inviteCodes map[string]string // 邀请码 -> roomID
+    mu         sync.RWMutex
+    gameService *GameService
+}
+```
+
+房间服务，管理所有房间的创建和生命周期。
+
+### 方法
+
+```go
+func NewRoomService(gameService *GameService) *RoomService
+```
+
+创建房间服务实例，初始化房间池。
+
+```go
+func (s *RoomService) CreateRoom(ownerID string, ownerNickname string, name string, maxPlayers int) (*RoomDTO, error)
+```
+
+创建房间。生成房间 ID 和邀请码 → 创建 Room 实例 → 房主加入 → 返回 RoomDTO。
+
+```go
+func (s *RoomService) JoinRoom(inviteCode string, playerID string, playerNickname string) (*RoomDTO, error)
+```
+
+加入房间。校验邀请码 → 校验房间状态 → 添加玩家 → 返回 RoomDTO。
+
+```go
+func (s *RoomService) LeaveRoom(roomID string, playerID string) error
+```
+
+退出房间。移除玩家 → 若房主退出则转移房主 → 房间为空则解散。
+
+```go
+func (s *RoomService) SetReady(roomID string, playerID string, ready bool) (*RoomDTO, error)
+```
+
+设置准备状态。更新玩家准备状态 → 返回 RoomDTO。
+
+```go
+func (s *RoomService) StartGame(roomID string, ownerID string) error
+```
+
+开始游戏。校验房主身份 → 校验全员准备 → 创建牌库 → 发牌 → 插入爆炸猫 → 启动房间主循环。
+
+```go
+func (s *RoomService) GetRoom(roomID string) (*Room, error)
+```
+
+按 ID 获取房间。房间不存在时返回错误。
+
+```go
+func (s *RoomService) GetRoomDTO(roomID string) (*RoomDTO, error)
+```
+
+获取房间的 DTO 表示。
+
+```go
+func (s *RoomService) ListRooms() []*RoomDTO
+```
+
+列出所有等待中的房间。
+
+```go
+func (s *RoomService) GenerateInviteCode() string
+```
+
+生成 6 位唯一邀请码。
+
+```go
+func (s *RoomService) DestroyRoom(roomID string)
+```
+
+销毁房间，从房间池移除。
+
+## 8.19 internal/service/turn_service.go
+
+回合服务，驱动回合流转，处理攻击累积和转向。
+
+### 结构体
+
+```go
+type TurnService struct{}
+```
+
+回合服务，无状态，提供回合调度的纯函数操作。
+
+### 方法
+
+```go
+func NewTurnService() *TurnService
+```
+
+创建回合服务实例。
+
+```go
+func (s *TurnService) ProcessTurnAdvance(gs *GameState) error
+```
+
+处理回合推进。根据当前阶段和待抽牌数决定下一步操作：进入抽牌阶段或轮到下家。
+
+```go
+func (s *TurnService) ProcessSkip(gs *GameState, playerID string) error
+```
+
+处理 Skip 牌效果。推进到下一个玩家。
+
+```go
+func (s *TurnService) ProcessAttack(gs *GameState, playerID string) error
+```
+
+处理 Attack 牌效果。待抽牌数 +2，下家直接进入抽牌阶段。
+
+```go
+func (s *TurnService) ProcessPlayerEliminated(gs *GameState, playerID string)
+```
+
+处理玩家出局。从回合调度器中移除该玩家。
+
+```go
+func (s *TurnService) GetAvailableActions(gs *GameState, playerID string) []string
+```
+
+获取指定玩家当前可执行的操作列表（如 ["play_card", "end_turn"] 或 ["draw_card"]）。
+
+```go
+func (s *TurnService) IsValidAction(gs *GameState, playerID string, actionType ActionType) bool
+```
+
+判断指定操作在当前回合阶段是否合法。
+
+## 8.20 internal/service/timer_service.go
+
+超时服务，管理回合超时、Nope 窗口和重连等待的定时器。
+
+### 结构体
+
+```go
+type TimerService struct {
+    timers     map[string]*time.Timer
+    mu         sync.Mutex
+    gameService *GameService
+}
+```
+
+超时服务，管理所有房间的定时器生命周期。
+
+### 方法
+
+```go
+func NewTimerService(gameService *GameService) *TimerService
+```
+
+创建超时服务实例。
+
+```go
+func (s *TimerService) StartTurnTimer(roomID string, duration time.Duration) *time.Timer
+```
+
+启动回合超时定时器。到达超时后自动触发 HandleTimeout。
+
+```go
+func (s *TimerService) ResetTurnTimer(roomID string, duration time.Duration) *time.Timer
+```
+
+重置回合超时定时器（玩家操作后重新计时）。
+
+```go
+func (s *TimerService) StopTurnTimer(roomID string)
+```
+
+停止回合超时定时器（回合结束时调用）。
+
+```go
+func (s *TimerService) StartNopeTimer(roomID string, duration time.Duration) *time.Timer
+```
+
+启动 Nope 窗口定时器。到达超时后自动触发 ResolveNopeWindow。
+
+```go
+func (s *TimerService) ResetNopeTimer(roomID string, duration time.Duration) *time.Timer
+```
+
+重置 Nope 窗口定时器（有人出 Nope 后重新计时）。
+
+```go
+func (s *TimerService) StopNopeTimer(roomID string)
+```
+
+停止 Nope 窗口定时器（结算完成后调用）。
+
+```go
+func (s *TimerService) StartReconnectTimer(roomID string, playerID string, duration time.Duration) *time.Timer
+```
+
+启动断线重连定时器。超时后标记玩家自动出局。
+
+```go
+func (s *TimerService) StopReconnectTimer(roomID string, playerID string)
+```
+
+停止重连定时器（玩家重连成功时调用）。
+
+```go
+func (s *TimerService) CleanupRoom(roomID string)
+```
+
+清理房间所有定时器（房间解散时调用）。
+
+## 8.21 internal/service/auth_service.go
+
+认证服务，处理用户注册、登录、Token 签发与验证。
+
+### 结构体
+
+```go
+type AuthService struct {
+    playerRepo PlayerRepository
+    jwtSecret  []byte
+    tokenExpiry time.Duration
+}
+```
+
+认证服务，管理用户身份认证和 JWT Token。
+
+### 方法
+
+```go
+func NewAuthService(playerRepo PlayerRepository, cfg *AuthConfig) *AuthService
+```
+
+创建认证服务实例，注入 PlayerRepository 和 JWT 配置。
+
+```go
+func (s *AuthService) Register(ctx context.Context, nickname string, password string) (*AuthResult, error)
+```
+
+注册新用户。校验昵称和密码 → 生成用户 ID → 加密密码 → 保存到数据库 → 生成 Token → 返回结果。
+
+```go
+func (s *AuthService) Login(ctx context.Context, playerID string, password string) (*AuthResult, error)
+```
+
+用户登录。查询用户 → 校验密码 → 生成 Token → 返回结果。
+
+```go
+func (s *AuthService) ValidateToken(tokenString string) (string, error)
+```
+
+验证 Token 有效性。解析 JWT → 校验签名和过期时间 → 返回玩家 ID。Token 无效或过期时返回错误。
+
+```go
+func (s *AuthService) RefreshToken(tokenString string) (*AuthResult, error)
+```
+
+刷新 Token。验证旧 Token → 生成新 Token → 返回结果。
+
+```go
+func (s *AuthService) generateToken(playerID string) (string, int64, error)
+```
+
+生成 JWT Token。签发包含玩家 ID 和过期时间的 Token。
+
+### 辅助结构体
+
+```go
+type AuthResult struct {
+    PlayerID  string // 玩家 ID
+    Nickname  string // 玩家昵称
+    Token     string // JWT Token
+    ExpiresAt int64  // 过期时间戳
+}
+```
+
+认证结果，包含玩家信息和 Token。
+
+## 8.22 internal/controller/auth_controller.go
+
+认证控制器，处理 HTTP 认证接口的请求解析和响应返回。
+
+### 结构体
+
+```go
+type AuthController struct {
+    authService *AuthService
+}
+```
+
+认证控制器，处理注册/登录/刷新 Token 的 HTTP 请求。
+
+### 方法
+
+```go
+func NewAuthController(authService *AuthService) *AuthController
+```
+
+创建认证控制器，注入 AuthService。
+
+```go
+func (c *AuthController) Register(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/auth/register。解析请求体 → 调用 AuthService.Register → 返回 JSON 响应。
+
+```go
+func (c *AuthController) Login(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/auth/login。解析请求体 → 调用 AuthService.Login → 返回 JSON 响应。
+
+```go
+func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/auth/refresh。解析请求体 → 调用 AuthService.RefreshToken → 返回 JSON 响应。
+
+## 8.23 internal/controller/room_controller.go
+
+房间控制器，处理 HTTP 房间接口的请求解析和响应返回。
+
+### 结构体
+
+```go
+type RoomController struct {
+    roomService *RoomService
+}
+```
+
+房间控制器，处理房间相关 HTTP 请求。
+
+### 方法
+
+```go
+func NewRoomController(roomService *RoomService) *RoomController
+```
+
+创建房间控制器，注入 RoomService。
+
+```go
+func (c *RoomController) CreateRoom(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/rooms。从 Token 中提取玩家 ID → 调用 RoomService.CreateRoom → 返回 JSON。
+
+```go
+func (c *RoomController) GetRoom(w http.ResponseWriter, r *http.Request)
+```
+
+处理 GET /api/v1/rooms/{room_id}。从 URL 提取 room_id → 调用 RoomService.GetRoomDTO → 返回 JSON。
+
+```go
+func (c *RoomController) JoinRoom(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/rooms/join。从请求体提取 invite_code → 调用 RoomService.JoinRoom → 返回 JSON。
+
+```go
+func (c *RoomController) LeaveRoom(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/rooms/{room_id}/leave。调用 RoomService.LeaveRoom → 返回 JSON。
+
+```go
+func (c *RoomController) SetReady(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/rooms/{room_id}/ready。解析 ready 状态 → 调用 RoomService.SetReady → 返回 JSON。
+
+```go
+func (c *RoomController) StartGame(w http.ResponseWriter, r *http.Request)
+```
+
+处理 POST /api/v1/rooms/{room_id}/start。调用 RoomService.StartGame → 返回 JSON。
+
+## 8.24 internal/controller/game_controller.go
+
+游戏控制器，处理 WebSocket 消息分发，将客户端动作路由到对应的 Service 方法。
+
+### 结构体
+
+```go
+type GameController struct {
+    gameService  *GameService
+    roomService  *RoomService
+    turnService  *TurnService
+}
+```
+
+游戏控制器，接收 WebSocket 消息并分发到业务服务。
+
+### 方法
+
+```go
+func NewGameController(gameService *GameService, roomService *RoomService, turnService *TurnService) *GameController
+```
+
+创建游戏控制器，注入依赖。
+
+```go
+func (c *GameController) Dispatch(room *Room, msg Message) (*GameStateDTO, error)
+```
+
+消息分发入口。根据 msg.Type 路由到对应的处理方法。未知类型返回错误。
+
+```go
+func (c *GameController) handlePlayCard(room *Room, msg Message) (*GameStateDTO, error)
+```
+
+分发 play_card 消息。解析 payload → 校验参数 → 调用 GameService.HandlePlayCard。
+
+```go
+func (c *GameController) handleDrawCard(room *Room, msg Message) (*GameStateDTO, error)
+```
+
+分发 draw_card 消息。校验阶段 → 调用 GameService.HandleDrawCard。
+
+```go
+func (c *GameController) handlePlayNope(room *Room, msg Message) (*GameStateDTO, error)
+```
+
+分发 play_nope 消息。校验 Nope 窗口 → 调用 GameService.HandlePlayNope。
+
+```go
+func (c *GameController) handleEndTurn(room *Room, msg Message) (*GameStateDTO, error)
+```
+
+分发 end_turn 消息。调用 GameService.HandleEndTurn。
+
+```go
+func (c *GameController) handleSelectTarget(room *Room, msg Message) (*GameStateDTO, error)
+```
+
+分发 select_target 消息。解析 payload → 调用 GameService.HandleSelectTarget。
+
+## 8.25 internal/controller/ws_controller.go
+
+WebSocket 控制器，管理连接升级、读写、断线检测和重连。
+
+### 结构体
+
+```go
+type WsController struct {
+    upgrader    websocket.Upgrader
+    gameService *GameService
+    roomService *RoomService
+    connections map[string]map[string]*WebSocketConn // roomID -> playerID -> conn
+    mu          sync.RWMutex
+}
+```
+
+WebSocket 控制器，管理所有 WebSocket 连接的生命周期。
+
+### 方法
+
+```go
+func NewWsController(gameService *GameService, roomService *RoomService) *WsController
+```
+
+创建 WebSocket 控制器。
+
+```go
+func (c *WsController) HandleUpgrade(w http.ResponseWriter, r *http.Request)
+```
+
+WebSocket 升级入口。从 URL 提取 room_id 和 token → 验证 Token → 升级连接 → 注册到房间。
+
+```go
+func (c *WsController) handleConnection(room *Room, playerID string, conn *websocket.Conn)
+```
+
+处理单个 WebSocket 连接的生命周期。启动读 goroutine → 监听消息 → 写入房间 Inbox → 检测断线。
+
+```go
+func (c *WsController) readLoop(room *Room, playerID string, conn *websocket.Conn)
+```
+
+读循环。从 WebSocket 读取 JSON 消息 → 解析为 Message → 写入房间 Inbox。读错误时触发断线处理。
+
+```go
+func (c *WsController) writeLoop(roomID string, playerID string, conn *websocket.Conn, writeCh chan []byte)
+```
+
+写循环。从 writeCh 读取数据 → 写入 WebSocket 连接。写错误时关闭连接。
+
+```go
+func (c *WsController) RegisterConnection(roomID string, playerID string, conn *WebSocketConn)
+```
+
+注册连接，建立 playerID 到 WebSocket 连接的映射。
+
+```go
+func (c *WsController) UnregisterConnection(roomID string, playerID string)
+```
+
+注销连接，从映射中移除。
+
+```go
+func (c *WsController) GetConnection(roomID string, playerID string) (*WebSocketConn, error)
+```
+
+获取指定玩家的 WebSocket 连接。连接不存在时返回错误。
+
+```go
+func (c *WsController) SendToPlayer(roomID string, playerID string, data []byte) error
+```
+
+向指定玩家发送数据。通过 writeCh 写入 WebSocket 连接。
+
+```go
+func (c *WsController) BroadcastToRoom(roomID string, data []byte, excludePlayerIDs ...string)
+```
+
+向房间内所有玩家广播数据，可选排除指定玩家。
+
+```go
+func (c *WsController) HandleDisconnect(room *Room, playerID string)
+```
+
+处理断线。标记玩家为 Disconnected → 启动重连定时器 → 通知其他玩家。
+
+```go
+func (c *WsController) HandleReconnect(room *Room, playerID string, conn *websocket.Conn) error
+```
+
+处理重连。停止重连定时器 → 更新连接 → 重建写循环 → 发送完整状态视图。
+
+### 辅助结构体
+
+```go
+type WebSocketConn struct {
+    Conn    *websocket.Conn
+    WriteCh chan []byte
+    CloseCh chan struct{}
+}
+```
+
+WebSocket 连接封装，包含读/写 channel 和关闭信号。
+
+## 8.26 internal/view/serializer.go
+
+状态序列化器，按玩家视角过滤并序列化游戏状态。
+
+### 结构体
+
+```go
+type Serializer struct{}
+```
+
+序列化器，无状态，提供纯函数序列化操作。
+
+### 方法
+
+```go
+func NewSerializer() *Serializer
+```
+
+创建序列化器实例。
+
+```go
+func (s *Serializer) SerializeForPlayer(room *Room, playerID string) *GameStateDTO
+```
+
+按玩家视角序列化游戏状态。过滤对手手牌细节 → 填充可见信息 → 返回 GameStateDTO。
+
+```go
+func (s *Serializer) serializeHand(hand *Hand, playerID string, viewerID string) []CardDTO
+```
+
+序列化手牌。如果 viewerID == playerID 则返回完整卡牌信息，否则只返回张数。
+
+```go
+func (s *Serializer) serializeOpponents(room *Room, viewerID string) []PlayerDTO
+```
+
+序列化对手信息列表。每个对手只包含公开信息，不含手牌详情。
+
+```go
+func (s *Serializer) serializeDeckTop(deck *Deck, viewerID string, seeFuturePlayerID string) []CardDTO
+```
+
+序列化牌库顶牌。仅当 viewerID == seeFuturePlayerID 时才返回牌面信息。
+
+## 8.27 internal/view/event.go
+
+事件定义，服务端推送事件的消息结构。
+
+### 结构体
+
+```go
+type Event struct {
+    Type      string      `json:"type"`
+    Payload   interface{} `json:"payload"`
+    ReqID     string      `json:"req_id,omitempty"`
+    Timestamp int64       `json:"timestamp"`
+}
+```
+
+通用事件结构，所有服务端推送消息都使用此结构。
+
+### 事件工厂函数
+
+```go
+func NewStateUpdateEvent(state *GameStateDTO) *Event
+```
+
+创建 state_update 事件。
+
+```go
+func NewNopePromptEvent(action Action, remainingMs int) *Event
+```
+
+创建 nope_prompt 事件。
+
+```go
+func NewCardPlayedEvent(playerID string, cardIDs []string, actionType string) *Event
+```
+
+创建 card_played 事件。
+
+```go
+func NewCardDrawnEvent(playerID string, cardID string, isExploding bool) *Event
+```
+
+创建 card_drawn 事件。
+
+```go
+func NewPlayerTurnEvent(playerID string, phase string, pendingDraws int, availableActions []string) *Event
+```
+
+创建 player_turn 事件。
+
+```go
+func NewGameEvent(eventType string, message string, actorID string, targetID string) *Event
+```
+
+创建 game_event 事件。
+
+```go
+func NewPlayerEliminatedEvent(playerID string, reason string, survivingCount int) *Event
+```
+
+创建 player_eliminated 事件。
+
+```go
+func NewGameOverEvent(winnerID string, winnerNickname string, players []RankInfo, durationSec int, actionCount int) *Event
+```
+
+创建 game_over 事件。
+
+```go
+func NewErrorEvent(code int, message string, reqID string) *Event
+```
+
+创建 error 事件。
+
+### 辅助结构体
+
+```go
+type RankInfo struct {
+    PlayerID string `json:"id"`
+    Nickname string `json:"nickname"`
+    Rank     int    `json:"rank"`
+    Alive    bool   `json:"alive"`
+}
+```
+
+排名字段，用于游戏结束事件中的玩家排名。
+
+## 8.28 internal/view/response.go
+
+统一 HTTP 响应格式和错误码封装。
+
+### 结构体
+
+```go
+type Response struct {
+    Code    int         `json:"code"`
+    Message string      `json:"message"`
+    Data    interface{} `json:"data,omitempty"`
+}
+```
+
+统一 HTTP 响应结构体，所有接口返回此格式。
+
+### 函数
+
+```go
+func Success(data interface{}) *Response
+```
+
+创建成功响应，code=0，message="success"。
+
+```go
+func Error(code int, message string) *Response
+```
+
+创建错误响应，包含错误码和错误消息。
+
+```go
+func FromGameError(err *GameError) *Response
+```
+
+从 GameError 创建错误响应。
+
+```go
+func WriteJSON(w http.ResponseWriter, status int, resp *Response)
+```
+
+将 Response 写入 HTTP 响应，设置 Content-Type 和状态码。
+
+## 8.29 internal/view/dto.go
+
+数据传输对象（DTO），客户端与服务器之间的数据载体。
+
+### 结构体
+
+（以下结构体已在模块六中定义字段，此处给出其方法）
+
+```go
+type RoomDTO struct {
+    RoomID     string       `json:"room_id"`
+    InviteCode string       `json:"invite_code"`
+    Name       string       `json:"name"`
+    Status     string       `json:"status"`
+    MaxPlayers int          `json:"max_players"`
+    Players    []PlayerDTO  `json:"players"`
+    OwnerID    string       `json:"owner_id"`
+    CreatedAt  int64        `json:"created_at"`
+}
+```
+
+房间数据 DTO，用于 HTTP 接口返回。
+
+```go
+type PlayerDTO struct {
+    ID        string `json:"id"`
+    Nickname  string `json:"nickname"`
+    HandSize  int    `json:"hand_size"`
+    Alive     bool   `json:"alive"`
+    IsReady   bool   `json:"is_ready"`
+    IsOwner   bool   `json:"is_owner"`
+}
+```
+
+玩家数据 DTO，用于 HTTP 接口和 WebSocket 状态推送。
+
+```go
+type GameStateDTO struct {
+    YourHand        []CardDTO    `json:"your_hand"`
+    Opponents       []PlayerDTO  `json:"opponents"`
+    DiscardPile     []CardDTO    `json:"discard_pile"`
+    DeckCount       int          `json:"deck_count"`
+    DeckTopCards    []CardDTO    `json:"deck_top_cards,omitempty"`
+    CurrentTurn     string       `json:"current_turn"`
+    PendingDraws    int          `json:"pending_draws"`
+    Phase           string       `json:"phase"`
+    Direction       int          `json:"direction"`
+    ActionStack     []StackEntryDTO `json:"action_stack"`
+    NopeRemainingMs int          `json:"nope_remaining_ms"`
+    GameStatus      string       `json:"game_status"`
+    RoundCount      int          `json:"round_count"`
+}
+```
+
+游戏状态 DTO，按玩家视角过滤后推送。
+
+```go
+type CardDTO struct {
+    ID   string `json:"id"`
+    Type string `json:"type"`
+    Name string `json:"name"`
+}
+```
+
+卡牌 DTO，用于客户端展示。
+
+```go
+type StackEntryDTO struct {
+    ActionType string `json:"action_type"`
+    ActorID    string `json:"actor_id"`
+    Timestamp  int64  `json:"timestamp"`
+}
+```
+
+动作栈条目 DTO，用于客户端展示动作栈概览。
+
+### 转换方法
+
+```go
+func RoomToDTO(room *Room) *RoomDTO
+```
+
+Room 实体转 RoomDTO。
+
+```go
+func PlayerToDTO(player *Player, isOwner bool) *PlayerDTO
+```
+
+Player 实体转 PlayerDTO（不含手牌详情）。
+
+```go
+func CardToDTO(card Card) *CardDTO
+```
+
+Card 实体转 CardDTO。
+
+```go
+func CardsToDTO(cards []Card) []CardDTO
+```
+
+Card 切片转 CardDTO 切片。
+
+```go
+func StackEntryToDTO(entry StackEntry) *StackEntryDTO
+```
+
+StackEntry 实体转 StackEntryDTO。
+
+## 8.30 internal/middleware/auth.go
+
+认证中间件，校验请求中的 JWT Token。
+
+### 结构体
+
+```go
+type AuthMiddleware struct {
+    authService *AuthService
+}
+```
+
+认证中间件，校验 Token 并注入玩家身份。
+
+### 方法
+
+```go
+func NewAuthMiddleware(authService *AuthService) *AuthMiddleware
+```
+
+创建认证中间件。
+
+```go
+func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler
+```
+
+返回 HTTP 中间件函数。从请求头提取 Token → 调用 AuthService.ValidateToken → 将 playerID 注入 context → 调用 next handler。
+
+## 8.31 internal/middleware/cors.go
+
+CORS 中间件，处理跨域请求。
+
+### 结构体
+
+```go
+type CORSMiddleware struct {
+    allowedOrigins []string
+    allowedMethods []string
+    allowedHeaders []string
+}
+```
+
+CORS 中间件，配置跨域策略。
+
+### 方法
+
+```go
+func NewCORSMiddleware(allowedOrigins []string) *CORSMiddleware
+```
+
+创建 CORS 中间件，设置允许的域名列表。
+
+```go
+func (m *CORSMiddleware) Handle(next http.Handler) http.Handler
+```
+
+返回 HTTP 中间件函数。设置 CORS 响应头 → 处理 OPTIONS 预检请求 → 调用 next handler。
+
+## 8.32 internal/middleware/recovery.go
+
+异常恢复中间件，捕获 panic 并返回 500 错误。
+
+### 结构体
+
+```go
+type RecoveryMiddleware struct {
+    logger *logger.Logger
+}
+```
+
+异常恢复中间件，防止 panic 导致服务崩溃。
+
+### 方法
+
+```go
+func NewRecoveryMiddleware(logger *logger.Logger) *RecoveryMiddleware
+```
+
+创建异常恢复中间件。
+
+```go
+func (m *RecoveryMiddleware) Recover(next http.Handler) http.Handler
+```
+
+返回 HTTP 中间件函数。defer 捕获 panic → 记录日志 → 返回 500 响应。
+
+## 8.33 internal/middleware/logging.go
+
+日志中间件，记录请求信息和链路追踪。
+
+### 结构体
+
+```go
+type LoggingMiddleware struct {
+    logger *logger.Logger
+}
+```
+
+日志中间件，记录请求耗时和状态码。
+
+### 方法
+
+```go
+func NewLoggingMiddleware(logger *logger.Logger) *LoggingMiddleware
+```
+
+创建日志中间件。
+
+```go
+func (m *LoggingMiddleware) LogRequest(next http.Handler) http.Handler
+```
+
+返回 HTTP 中间件函数。记录请求方法、路径、耗时、状态码。
+
+## 8.34 internal/router/router.go
+
+路由注册器，统一定义和管理 HTTP 路由和 WebSocket 端点。
+
+### 结构体
+
+```go
+type Router struct {
+    mux              *http.ServeMux
+    authMiddleware   *AuthMiddleware
+    corsMiddleware   *CORSMiddleware
+    recoveryMiddleware *RecoveryMiddleware
+    loggingMiddleware *LoggingMiddleware
+    authController   *AuthController
+    roomController   *RoomController
+    wsController     *WsController
+}
+```
+
+路由管理器，持有所有中间件和控制器引用。
+
+### 方法
+
+```go
+func NewRouter(
+    authMiddleware *AuthMiddleware,
+    corsMiddleware *CORSMiddleware,
+    recoveryMiddleware *RecoveryMiddleware,
+    loggingMiddleware *LoggingMiddleware,
+    authController *AuthController,
+    roomController *RoomController,
+    wsController *WsController,
+) *Router
+```
+
+创建路由管理器，注入所有依赖。
+
+```go
+func (r *Router) SetupRoutes()
+```
+
+注册所有路由。按顺序：中间件链 → 认证路由 → 房间路由 → WebSocket 路由。
+
+```go
+func (r *Router) GetMux() *http.ServeMux
+```
+
+获取配置好的 http.ServeMux 实例，用于启动 HTTP 服务器。
+
+```go
+func (r *Router) wrapMiddleware(handler http.HandlerFunc) http.Handler
+```
+
+将中间件链应用到 handler。顺序：Recovery → Logging → CORS → Auth → Handler。
+
+## 8.35 internal/router/routes.go
+
+路由表定义，集中管理路径、方法和 Handler 的映射关系。
+
+### 结构体
+
+```go
+type Route struct {
+    Method  string           // HTTP 方法：GET/POST/PUT/DELETE
+    Path    string           // URL 路径，支持路径参数语法 {param}
+    Handler http.HandlerFunc // 处理函数
+    Public  bool             // 是否需要认证
+}
+```
+
+路由定义，描述一个 HTTP 接口的元信息。
+
+### 函数
+
+```go
+func GetRoutes(ac *AuthController, rc *RoomController, wsc *WsController) []Route
+```
+
+返回所有路由定义列表。包含路径、方法、Handler 映射。
+
+### 路由表
+
+| 方法 | 路径 | Handler | 认证 |
+|-|-|-|-|
+| POST | /api/v1/auth/register | ac.Register | 否 |
+| POST | /api/v1/auth/login | ac.Login | 否 |
+| POST | /api/v1/auth/refresh | ac.RefreshToken | 是 |
+| POST | /api/v1/rooms | rc.CreateRoom | 是 |
+| GET | /api/v1/rooms/{room_id} | rc.GetRoom | 是 |
+| POST | /api/v1/rooms/join | rc.JoinRoom | 是 |
+| POST | /api/v1/rooms/{room_id}/leave | rc.LeaveRoom | 是 |
+| POST | /api/v1/rooms/{room_id}/ready | rc.SetReady | 是 |
+| POST | /api/v1/rooms/{room_id}/start | rc.StartGame | 是 |
+| GET | /ws | wsc.HandleUpgrade | 是 |
+
+## 8.36 pkg/logger/logger.go
+
+日志工具，结构化日志输出。
+
+### 结构体
+
+```go
+type Logger struct {
+    level  string
+    format string
+    output io.Writer
+}
+```
+
+日志器，支持分级和结构化输出。
+
+### 方法
+
+```go
+func NewLogger(cfg *LogConfig) (*Logger, error)
+```
+
+创建日志器实例，配置日志级别、格式和输出目标。
+
+```go
+func (l *Logger) Debug(msg string, fields ...Field)
+```
+
+输出 Debug 级别日志。
+
+```go
+func (l *Logger) Info(msg string, fields ...Field)
+```
+
+输出 Info 级别日志。
+
+```go
+func (l *Logger) Warn(msg string, fields ...Field)
+```
+
+输出 Warn 级别日志。
+
+```go
+func (l *Logger) Error(msg string, fields ...Field)
+```
+
+输出 Error 级别日志。
+
+```go
+func (l *Logger) WithField(key string, value interface{}) *Logger
+```
+
+创建一个带指定字段的子日志器（链式调用）。
+
+### 辅助结构体
+
+```go
+type Field struct {
+    Key   string
+    Value interface{}
+}
+```
+
+日志字段，键值对形式。
+
+### 函数
+
+```go
+func StringField(key string, value string) Field
+```
+
+创建字符串类型日志字段。
+
+```go
+func IntField(key string, value int) Field
+```
+
+创建整型日志字段。
+
+```go
+func ErrorField(err error) Field
+```
+
+创建错误类型日志字段。
+
+## 8.37 pkg/errors/errors.go
+
+自定义错误封装，支持错误链和错误码。
+
+### 结构体
+
+```go
+type AppError struct {
+    Code    int
+    Message string
+    Err     error
+    Stack   string
+}
+```
+
+应用错误，包含错误码、消息、原始错误和调用栈。
+
+### 方法
+
+```go
+func NewAppError(code int, message string) *AppError
+```
+
+创建应用错误，记录调用栈。
+
+```go
+func WrapError(err error, code int, message string) *AppError
+```
+
+包装已有错误，添加错误码和上下文。
+
+```go
+func (e *AppError) Error() string
+```
+
+实现 error 接口。
+
+```go
+func (e *AppError) Unwrap() error
+```
+
+实现 unwrap 接口，支持 errors.Is/errors.As 错误链遍历。
+
+```go
+func (e *AppError) GetCode() int
+```
+
+获取错误码。
+
+## 8.38 pkg/utils/utils.go
+
+通用工具函数。
+
+### 函数
+
+```go
+func GenerateID(prefix string) string
+```
+
+生成唯一 ID。格式：前缀 + 随机字符串（如 "u_abc123"）。
+
+```go
+func GenerateRoomID() string
+```
+
+生成房间 ID。格式："r\_" + 8 位随机字符串。
+
+```go
+func GenerateInviteCode() string
+```
+
+生成 6 位大写字母数字邀请码。
+
+```go
+func ShuffleSlice[T any](items []T)
+```
+
+泛型切片洗牌，使用 Fisher-Yates 算法。
+
+```go
+func ContainsString(slice []string, item string) bool
+```
+
+判断字符串切片中是否包含指定元素。
+
+```go
+func RemoveFromSlice[T comparable](slice []T, item T) []T
+```
+
+从切片中移除指定元素（泛型）。
+
+```go
+func IndexOf[T comparable](slice []T, item T) int
+```
+
+返回元素在切片中的索引，未找到返回 -1。
+
+```go
+func HashPassword(password string) (string, error)
+```
+
+使用 bcrypt 对密码进行哈希。
+
+```go
+func CheckPassword(password string, hash string) bool
+```
+
+校验密码与哈希是否匹配。
+
+## 8.39 migrations/001_init.sql
+
+数据库初始化脚本，定义表结构。
+
+### 表结构
+
+**users 表** — 用户账号信息
+
+| 字段 | 类型 | 约束 | 说明 |
+|-|-|-|-|
+| id | VARCHAR(32) | PRIMARY KEY | 用户 ID |
+| nickname | VARCHAR(32) | UNIQUE NOT NULL | 用户昵称 |
+| password_hash | VARCHAR(255) | NOT NULL | 密码哈希 |
+| games_played | INT | DEFAULT 0 | 总局数 |
+| games_won | INT | DEFAULT 0 | 胜场 |
+| total_score | INT | DEFAULT 0 | 总分 |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | 创建时间 |
+| updated_at | TIMESTAMPTZ | DEFAULT NOW() | 更新时间 |
+
+**game_records 表** — 游戏历史记录
+
+| 字段 | 类型 | 约束 | 说明 |
+|-|-|-|-|
+| id | UUID | PRIMARY KEY | 记录 ID |
+| room_id | VARCHAR(32) | NOT NULL | 房间 ID |
+| players | JSONB | NOT NULL | 参与玩家列表 |
+| winner_id | VARCHAR(32) | NOT NULL | 获胜者 ID |
+| started_at | TIMESTAMPTZ | NOT NULL | 开始时间 |
+| finished_at | TIMESTAMPTZ | NOT NULL | 结束时间 |
+| duration_sec | INT | NOT NULL | 对局时长 |
+| action_log | JSONB |  | 操作日志 |
+| created_at | TIMESTAMPTZ | DEFAULT NOW() | 创建时间 |
+
+**indexes** — 索引
+
+| 索引名 | 表 | 字段 | 说明 |
+|-|-|-|-|
+| idx_users_nickname | users | nickname | 昵称快速查询 |
+| idx_game_records_winner | game_records | winner_id | 按获胜者查询 |
+| idx_game_records_created | game_records | created_at | 按时间排序 |
+
+- 广播时在 View 层按玩家视角过滤，确保每个玩家只能看到自己可见的信息
+- 服务端代码中**不存在**"客户端请求对手手牌"的接口路径
+
+按玩家视角过滤后发送，每个玩家看到的 state 不同。
+
+| 字段 | 类型 | 可见性 | 说明 |
+|-|-|-|-|
+| YourHand | []Card | 仅自己 | 自己的手牌（完整信息） |
+| Opponents | []PlayerDTO | 全员 | 对手信息（不含手牌详情） |
+| DiscardPile | []Card | 全员 | 弃牌堆（公开） |
+| DeckCount | int | 全员 | 牌库剩余张数 |
+| DeckTopCards | []Card | 仅预言牌使用者 | 牌库顶牌（仅在使用预言后可见） |
+| CurrentTurn | string | 全员 | 当前回合玩家 ID |
+| PendingDraws | int | 全员 | 待抽牌数 |
+| Phase | string | 全员 | 当前回合阶段 |
+| ActionStack | []StackEntry | 全员 | 动作栈概览 |
+| NopeRemainingMs | int | 全员 | Nope 窗口剩余毫秒 |
+| GameStatus | string | 全员 | 游戏整体状态 |
+| Direction | int | 全员 | 回合方向 |
+
+```
+Controller → Service → Repository (接口)
+                  ↓
+              Model (纯数据，零依赖)
+```
+
+- 依赖方向严格**从上到下**：Controller 依赖 Service，Service 依赖 Repository 接口和 Model
+- Model 层**零依赖**，不导入任何 internal 包
+- Repository 接口定义在 repository/interfaces.go，实现放在同包不同文件
+- 所有依赖通过**构造函数注入**（NewXXX），不使用全局单例或 init()

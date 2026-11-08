@@ -1,0 +1,43 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 10
+  write_timeout: 10
+  mode: "debug"
+
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 10
+
+database:
+  host: "127.0.0.1"
+  port: 5432
+  user: "boomcat"
+  password: ""
+  name: "boomcat"
+  ssl_mode: "disable"
+  max_conns: 20
+
+auth:
+  jwt_secret: "change-me-in-production"
+  access_token_ttl: 3600
+  refresh_token_ttl: 259200
+  bcrypt_cost: 10
+
+game:
+  default_max_players: 5
+  min_players: 2
+  max_players: 5
+  turn_timeout_sec: 60
+  nope_window_sec: 3
+  reconnect_timeout_sec: 90
+  state_snapshot_interval_ms: 200
+
+log:
+  level: "info"
+  format: "text"
+  output: "stdout"
+  file_path: "./logs/server.log"
